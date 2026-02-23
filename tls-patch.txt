@@ -1,0 +1,1348 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: TLS Plugin Support
+Date: 2026-02-24
+Subject: [PATCH v6] security: add pluggable TLS hooks via external shared library
+
+Adds support for delegating TLS certificate provisioning and/or peer
+verification to an external shared library (.so). The plugin is
+activated solely by setting –tls-plugin-so (plus at least one hook
+flag); absence of those flags leaves all existing behaviour unchanged.
+
+File validation bypass matrix:
+–tls-plugin-get-cert set    => node.crt + node.key not required on disk
+–tls-plugin-verify-cert set => ca.crt not required on disk
+both set                     => –certs-dir may be absent entirely
+
+New files:
+pkg/security/tlsplugin/abi.h
+pkg/security/tlsplugin/plugin_cfg.go
+pkg/security/tlsplugin/plugin.go
+pkg/security/tlsplugin/BUILD.bazel
+
+## Modified files:
+pkg/base/config.go
+pkg/cli/cliflags/flags.go
+pkg/cli/flags.go
+pkg/security/certificate_manager.go
+pkg/rpc/tls.go
+pkg/rpc/context.go
+
+diff –git a/pkg/security/tlsplugin/abi.h b/pkg/security/tlsplugin/abi.h
+new file mode 100644
+— /dev/null
++++ b/pkg/security/tlsplugin/abi.h
+@@ -0,0 +1,113 @@
++/*
+
+- - CockroachDB TLS plugin ABI
+- - ==========================
+- - A plugin shared library may export either or both of the two
+- - configurable hook functions below.  Which symbols to call is declared
+- - via CLI flags (–tls-plugin-get-cert, –tls-plugin-verify-cert);
+- - the names are NOT fixed.
+- - 
+- - If get-cert is configured the plugin MUST also export the fixed symbol
+- - “crdb_tls_free_buf” (HOOK 3).  CockroachDB resolves it automatically at
+- - load time; it does NOT appear in flags or config.
+- - 
+- - All pointers passed INTO hooks are valid only for the duration of the call.
+- - Buffers passed OUT (cert_out, key_out) must be allocated by the plugin
+- - with its own allocator and will be released via crdb_tls_free_buf.
+- - 
+- - Return value convention: 0 = success/trusted, non-zero = error/rejected.
+- */
+  +#ifndef COCKROACH_TLS_PLUGIN_ABI_H
+  +#define COCKROACH_TLS_PLUGIN_ABI_H
+- 
+
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern “C” {
++#endif
++
++/*
+
+- - tls_conn_info_t – connection context passed to every hook.
+- - Fields are NULL/0 when information is unavailable (e.g. peer_addr is “”
+- - inside VerifyPeerCertificate because Go’s crypto/tls does not expose
+- - net.Conn at that point).
+- */
+  +typedef struct {
+- /* “ip:port” of the remote peer, NUL-terminated. May be “”. */
+- const char *peer_addr;
+- /* TLS SNI from the ClientHello, NUL-terminated. NULL if absent. */
+- const char *server_name;
+- /*
+- ```
+  * Negotiated TLS version after handshake: 0x0304=TLS1.3, 0x0303=TLS1.2,
+  ```
+- ```
+  * 0=unknown. Only set in verify-cert; always 0 in get-cert.
+  ```
+- ```
+  */
+  ```
+- uint16_t tls_version;
+- /*
+- ```
+  * 1 = intra-cluster node-to-node RPC connection.
+  ```
+- ```
+  * 0 = external SQL/HTTP client connection.
+  ```
+- ```
+  */
+  ```
+- uint8_t is_inter_node;
+- /* Opaque NUL-terminated connection ID for log correlation. */
+- const char *conn_id;
+  +} tls_conn_info_t;
+- 
+- 
+
++/*
+
+- - HOOK 1 – Certificate provisioning (flag: –tls-plugin-get-cert)
+- - -----
+- - Called when the local side must present a certificate.
+- - Invoked for both server-side (GetCertificate) and client-side
+- - (GetClientCertificate) TLS handshakes.
+- - 
+- - On success allocate *cert_out and *key_out with your own allocator
+- - (e.g. malloc); CockroachDB releases them via crdb_tls_free_buf.
+- - Both are single DER-encoded items (X.509 certificate and private key).
+- - 
+- - When this hook is configured the plugin MUST also export crdb_tls_free_buf.
+- - 
+- - Returns 0 on success, non-zero to abort the handshake.
+- */
+  +typedef int (*crdb_tls_get_cert_fn)(
+- const tls_conn_info_t *conn_info,
+- unsigned char        **cert_out, int *cert_len,
+- unsigned char        **key_out,  int *key_len
+  +);
+- 
+- 
+
++/*
+
+- - HOOK 2 – Peer certificate verification (flag: –tls-plugin-verify-cert)
+- - -----
+- - Called after the peer sends its certificate chain.
+- - Standard Go x509 chain validation is DISABLED when this hook is configured
+- - (InsecureSkipVerify=true); the plugin is the sole trust authority.
+- - 
+- - raw_certs[0] is the peer leaf cert (DER); subsequent entries are the chain.
+- - cert_lens is a parallel array of byte lengths.
+- - All cert buffers are owned by CockroachDB; do not free or retain them.
+- - 
+- - Returns 0 if the peer is trusted, non-zero to abort the handshake.
+- */
+  +typedef int (*crdb_tls_verify_cert_fn)(
+- const tls_conn_info_t        *conn_info,
+- const unsigned char * const  *raw_certs,
+- const int                    *cert_lens,
+- int                           n_certs
+  +);
+- 
+- 
+
++/*
+
+- - HOOK 3 – Buffer release  (symbol name FIXED: “crdb_tls_free_buf”)
+- - -----
+- - Releases a buffer allocated by the plugin inside get-cert.
+- - Must use the same allocator as get-cert.
+- - Required (and auto-resolved) only when get-cert is configured.
+- - Must tolerate ptr == NULL.
+- */
+  +typedef void (*crdb_tls_free_buf_fn)(void *ptr);
+- 
+
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* COCKROACH_TLS_PLUGIN_ABI_H */
+diff –git a/pkg/security/tlsplugin/plugin_cfg.go b/pkg/security/tlsplugin/plugin_cfg.go
+new file mode 100644
+— /dev/null
++++ b/pkg/security/tlsplugin/plugin_cfg.go
+@@ -0,0 +1,72 @@
++// Copyright 2026 The Cockroach Authors.
++//
++// Use of this software is governed by the CockroachDB Software License
++// included in the /LICENSE file.
++
++package tlsplugin
++
++import “github.com/cockroachdb/errors”
++
++// TLSPluginConfig configures an external shared library that overrides
++// TLS certificate provisioning and/or peer verification.
++//
++// The config is entirely optional. When base.Config.TLSPlugin is nil the
++// standard CockroachDB certificate-manager path is used unchanged.
++//
++// CLI flags:
++//
++//	–tls-plugin-so           path to the shared library (.so)
++//	–tls-plugin-get-cert     symbol name for HOOK 1 (optional)
++//	–tls-plugin-verify-cert  symbol name for HOOK 2 (optional)
++//
++// Effect on certificate file requirements:
++//
++//	get-cert configured    => node.crt and node.key are not read from disk
++//	verify-cert configured => ca.crt is not read from disk
++//	both configured        => –certs-dir may be absent entirely
++type TLSPluginConfig struct {
+
+- // SoPath is the filesystem path of the shared library to dlopen.
+- SoPath string `yaml:"so-path"`
+- 
+- // Functions names the exported C symbols to resolve in the library.
+- // See pkg/security/tlsplugin/abi.h for the required C signatures.
+- Functions struct {
+- ```
+    // GetCert names the symbol implementing crdb_tls_get_cert_fn.
+  ```
+- ```
+    // When empty, the standard certificate manager supplies the cert.
+  ```
+- ```
+    GetCert string `yaml:"get-cert"`
+  ```
+- 
+- ```
+    // VerifyCert names the symbol implementing crdb_tls_verify_cert_fn.
+  ```
+- ```
+    // When empty, standard x509 chain validation is used.
+  ```
+- ```
+    VerifyCert string `yaml:"verify-cert"`
+  ```
+- } `yaml:"functions"`
+  +}
+- 
+
++// Validate returns an error if the configuration is self-inconsistent.
++// A nil receiver is valid (means “no plugin”).
++func (c *TLSPluginConfig) Validate() error {
+
+- if c == nil {
+- ```
+    return nil
+  ```
+- }
+- if c.SoPath == “” {
+- ```
+    return errors.New("tls-plugin: so-path must not be empty")
+  ```
+- }
+- if c.Functions.GetCert == “” && c.Functions.VerifyCert == “” {
+- ```
+    return errors.New("tls-plugin: at least one of " +
+  ```
+- ```
+    	"--tls-plugin-get-cert or --tls-plugin-verify-cert must be specified")
+  ```
+- }
+- return nil
+  +}
+- 
+
++// SkipNodeCert reports whether node.crt/node.key are not required on disk
++// (because the plugin provides the local certificate).
++// Safe to call on a nil receiver (returns false).
++func (c *TLSPluginConfig) SkipNodeCert() bool {
+
+- return c != nil && c.Functions.GetCert != “”
+  +}
+- 
+
++// SkipCACert reports whether ca.crt is not required on disk (because the
++// plugin performs peer verification itself).
++// Safe to call on a nil receiver (returns false).
++func (c *TLSPluginConfig) SkipCACert() bool {
+
+- return c != nil && c.Functions.VerifyCert != “”
+  +}
+- 
+
++// SkipCertsDir reports whether –certs-dir may be absent entirely.
++// True only when both node cert and CA cert are fully handled by the plugin.
++func (c *TLSPluginConfig) SkipCertsDir() bool {
+
+- return c.SkipNodeCert() && c.SkipCACert()
+  +}
+  diff –git a/pkg/security/tlsplugin/plugin.go b/pkg/security/tlsplugin/plugin.go
+  new file mode 100644
+  — /dev/null
+  +++ b/pkg/security/tlsplugin/plugin.go
+  @@ -0,0 +1,265 @@
+  +// Copyright 2026 The Cockroach Authors.
+  +//
+  +// Use of this software is governed by the CockroachDB Software License
+  +// included in the /LICENSE file.
+- 
+
++// Plugin is only available on Linux (uses dlopen/dlsym).
++//go:build linux
++
++package tlsplugin
++
++/*
++#cgo LDFLAGS: -ldl
++#include “abi.h”
++#include <dlfcn.h>
++#include <stdlib.h>
++#include <string.h>
++
++static void *crdb_dlopen(const char *path, char **errmsg) {
+
+- void *h = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+- if (!h) { *errmsg = strdup(dlerror()); }
+- return h;
+  +}
+- 
+
++static void *crdb_dlsym(void *handle, const char *sym, char **errmsg) {
+
+- dlerror();
+- void *p = dlsym(handle, sym);
+- const char *e = dlerror();
+- if (e) { *errmsg = strdup(e); return NULL; }
+- return p;
+  +}
+- 
+
++static int call_get_cert(
+
+- crdb_tls_get_cert_fn fn, const tls_conn_info_t *info,
+- unsigned char **cert_out, int *cert_len,
+- unsigned char **key_out,  int *key_len)
+  +{
+- return fn(info, cert_out, cert_len, key_out, key_len);
+  +}
+- 
+
++static int call_verify_cert(
+
+- crdb_tls_verify_cert_fn fn, const tls_conn_info_t *info,
+- const unsigned char * const *certs, const int *lens, int n)
+  +{
+- return fn(info, certs, lens, n);
+  +}
+- 
+
++static void call_free_buf(crdb_tls_free_buf_fn fn, void *ptr) { fn(ptr); }
++*/
++import “C”
++
++import (
+
+- “crypto/tls”
+- “crypto/x509”
+- “fmt”
+- “net”
+- “unsafe”
+- 
+- “github.com/cockroachdb/errors”
+  +)
+- 
+
++// TLSPlugin is a loaded instance of an external TLS plugin shared library.
++// All exported methods are nil-safe: a nil *TLSPlugin is always a no-op.
++type TLSPlugin struct {
+
+- cfg     *TLSPluginConfig
+- handle  unsafe.Pointer          // dlopen handle
+- getCert C.crdb_tls_get_cert_fn
+- verify  C.crdb_tls_verify_cert_fn
+- freeBuf C.crdb_tls_free_buf_fn
+  +}
+- 
+
++// Load opens the shared library described by cfg and resolves all configured
++// symbols. Returns (nil, nil) when cfg is nil (no plugin configured).
++func Load(cfg *TLSPluginConfig) (*TLSPlugin, error) {
+
+- if cfg == nil {
+- ```
+    return nil, nil
+  ```
+- }
+- if err := cfg.Validate(); err != nil {
+- ```
+    return nil, err
+  ```
+- }
+- 
+- p := &TLSPlugin{cfg: cfg}
+- 
+- // dlopen the shared library.
+- cpath := C.CString(cfg.SoPath)
+- defer C.free(unsafe.Pointer(cpath))
+- var cerr *C.char
+- p.handle = C.crdb_dlopen(cpath, &cerr)
+- if p.handle == nil {
+- ```
+    msg := C.GoString(cerr)
+  ```
+- ```
+    C.free(unsafe.Pointer(cerr))
+  ```
+- ```
+    return nil, errors.Newf("tlsplugin: dlopen(%q): %s", cfg.SoPath, msg)
+  ```
+- }
+- 
+- // Resolve get-cert symbol.
+- if cfg.Functions.GetCert != “” {
+- ```
+    sym, err := dlsym(p.handle, cfg.Functions.GetCert)
+  ```
+- ```
+    if err != nil {
+  ```
+- ```
+    	return nil, errors.Wrapf(err, "tlsplugin: resolving get-cert symbol %q", cfg.Functions.GetCert)
+  ```
+- ```
+    }
+  ```
+- ```
+    p.getCert = C.crdb_tls_get_cert_fn(sym)
+  ```
+- 
+- ```
+    // crdb_tls_free_buf is mandatory when get-cert is configured.
+  ```
+- ```
+    freeSym, err := dlsym(p.handle, "crdb_tls_free_buf")
+  ```
+- ```
+    if err != nil {
+  ```
+- ```
+    	return nil, errors.Newf(
+  ```
+- ```
+    		"tlsplugin: get-cert is configured but plugin does not export "+
+  ```
+- ```
+    			"\"crdb_tls_free_buf\": %s", err)
+  ```
+- ```
+    }
+  ```
+- ```
+    p.freeBuf = C.crdb_tls_free_buf_fn(freeSym)
+  ```
+- }
+- 
+- // Resolve verify-cert symbol.
+- if cfg.Functions.VerifyCert != “” {
+- ```
+    sym, err := dlsym(p.handle, cfg.Functions.VerifyCert)
+  ```
+- ```
+    if err != nil {
+  ```
+- ```
+    	return nil, errors.Wrapf(err, "tlsplugin: resolving verify-cert symbol %q", cfg.Functions.VerifyCert)
+  ```
+- ```
+    }
+  ```
+- ```
+    p.verify = C.crdb_tls_verify_cert_fn(sym)
+  ```
+- }
+- 
+- return p, nil
+  +}
+- 
+
++// dlsym wraps C.crdb_dlsym and returns the resolved pointer or an error.
++func dlsym(handle unsafe.Pointer, name string) (unsafe.Pointer, error) {
+
+- csym := C.CString(name)
+- defer C.free(unsafe.Pointer(csym))
+- var cerr *C.char
+- ptr := C.crdb_dlsym(handle, csym, &cerr)
+- if ptr == nil {
+- ```
+    msg := C.GoString(cerr)
+  ```
+- ```
+    C.free(unsafe.Pointer(cerr))
+  ```
+- ```
+    return nil, fmt.Errorf("%s", msg)
+  ```
+- }
+- return ptr, nil
+  +}
+- 
+
++// InjectIntoTLSConfig wires the plugin hooks into tlsCfg.
++// isInterNode is forwarded to the plugin via tls_conn_info_t.is_inter_node.
++// No-op when the receiver is nil or tlsCfg is nil.
++func (p *TLSPlugin) InjectIntoTLSConfig(tlsCfg *tls.Config, isInterNode bool) {
+
+- if p == nil || tlsCfg == nil {
+- ```
+    return
+  ```
+- }
+- 
+- interNodeBit := C.uint8_t(0)
+- if isInterNode {
+- ```
+    interNodeBit = 1
+  ```
+- }
+- 
+- if p.getCert != nil {
+- ```
+    getCertFn := p.getCert
+  ```
+- ```
+    freeBufFn := p.freeBuf
+  ```
+- 
+- ```
+    // Server-side: called when a remote client connects to us.
+  ```
+- ```
+    tlsCfg.GetCertificate = func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+  ```
+- ```
+    	peerAddr := ""
+  ```
+- ```
+    	if hello.Conn != nil {
+  ```
+- ```
+    		peerAddr = hello.Conn.RemoteAddr().String()
+  ```
+- ```
+    	}
+  ```
+- ```
+    	info := makeCConnInfo(hello.ServerName, peerAddr, interNodeBit)
+  ```
+- ```
+    	defer freeCConnInfo(info)
+  ```
+- 
+- ```
+    	var certPtr *C.uchar
+  ```
+- ```
+    	var certLen C.int
+  ```
+- ```
+    	var keyPtr *C.uchar
+  ```
+- ```
+    	var keyLen C.int
+  ```
+- ```
+    	if rc := C.call_get_cert(getCertFn, info, &certPtr, &certLen, &keyPtr, &keyLen); rc != 0 {
+  ```
+- ```
+    		return nil, fmt.Errorf("tlsplugin: get-cert returned %d", int(rc))
+  ```
+- ```
+    	}
+  ```
+- ```
+    	cert, err := parseCertAndKey(certPtr, certLen, keyPtr, keyLen)
+  ```
+- ```
+    	C.call_free_buf(freeBufFn, unsafe.Pointer(certPtr))
+  ```
+- ```
+    	C.call_free_buf(freeBufFn, unsafe.Pointer(keyPtr))
+  ```
+- ```
+    	return cert, err
+  ```
+- ```
+    }
+  ```
+- 
+- ```
+    // Client-side: called when we initiate a connection to a peer.
+  ```
+- ```
+    tlsCfg.GetClientCertificate = func(_ *tls.CertificateRequestInfo) (*tls.Certificate, error) {
+  ```
+- ```
+    	info := makeCConnInfo("", "", interNodeBit)
+  ```
+- ```
+    	defer freeCConnInfo(info)
+  ```
+- 
+- ```
+    	var certPtr *C.uchar
+  ```
+- ```
+    	var certLen C.int
+  ```
+- ```
+    	var keyPtr *C.uchar
+  ```
+- ```
+    	var keyLen C.int
+  ```
+- ```
+    	if rc := C.call_get_cert(getCertFn, info, &certPtr, &certLen, &keyPtr, &keyLen); rc != 0 {
+  ```
+- ```
+    		return nil, fmt.Errorf("tlsplugin: get-cert (client) returned %d", int(rc))
+  ```
+- ```
+    	}
+  ```
+- ```
+    	cert, err := parseCertAndKey(certPtr, certLen, keyPtr, keyLen)
+  ```
+- ```
+    	C.call_free_buf(freeBufFn, unsafe.Pointer(certPtr))
+  ```
+- ```
+    	C.call_free_buf(freeBufFn, unsafe.Pointer(keyPtr))
+  ```
+- ```
+    	return cert, err
+  ```
+- ```
+    }
+  ```
+- }
+- 
+- if p.verify != nil {
+- ```
+    verifyFn := p.verify
+  ```
+- ```
+    // Disable standard x509 chain validation; the plugin is the sole trust authority.
+  ```
+- ```
+    tlsCfg.InsecureSkipVerify = true //nolint:gosec
+  ```
+- ```
+    tlsCfg.VerifyPeerCertificate = func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
+  ```
+- ```
+    	if len(rawCerts) == 0 {
+  ```
+- ```
+    		return errors.New("tlsplugin: peer sent no certificates")
+  ```
+- ```
+    	}
+  ```
+- ```
+    	n := len(rawCerts)
+  ```
+- ```
+    	ptrs := make([]*C.uchar, n)
+  ```
+- ```
+    	lens := make([]C.int, n)
+  ```
+- ```
+    	for i, der := range rawCerts {
+  ```
+- ```
+    		ptrs[i] = (*C.uchar)(unsafe.Pointer(&der[0]))
+  ```
+- ```
+    		lens[i] = C.int(len(der))
+  ```
+- ```
+    	}
+  ```
+- ```
+    	info := makeCConnInfo("", "", interNodeBit)
+  ```
+- ```
+    	defer freeCConnInfo(info)
+  ```
+- ```
+    	rc := C.call_verify_cert(verifyFn, info,
+  ```
+- ```
+    		(**C.uchar)(unsafe.Pointer(&ptrs[0])),
+  ```
+- ```
+    		(*C.int)(unsafe.Pointer(&lens[0])),
+  ```
+- ```
+    		C.int(n))
+  ```
+- ```
+    	if rc != 0 {
+  ```
+- ```
+    		return fmt.Errorf("tlsplugin: verify-cert rejected peer (rc=%d)", int(rc))
+  ```
+- ```
+    	}
+  ```
+- ```
+    	return nil
+  ```
+- ```
+    }
+  ```
+- }
+  +}
+- 
+
++// makeCConnInfo allocates a tls_conn_info_t on the C heap.
++// Must be paired with freeCConnInfo.
++func makeCConnInfo(serverName, peerAddr string, isInterNode C.uint8_t) *C.tls_conn_info_t {
+
+- info := (*C.tls_conn_info_t)(C.calloc(1, C.sizeof_tls_conn_info_t))
+- info.peer_addr = C.CString(peerAddr)
+- info.server_name = C.CString(serverName)
+- info.is_inter_node = isInterNode
+- return info
+  +}
+- 
+
++// freeCConnInfo releases a tls_conn_info_t created by makeCConnInfo.
++func freeCConnInfo(info *C.tls_conn_info_t) {
+
+- C.free(unsafe.Pointer(info.peer_addr))
+- C.free(unsafe.Pointer(info.server_name))
+- C.free(unsafe.Pointer(info))
+  +}
+- 
+
++// peerAddr extracts “ip:port” from a net.Conn or returns “”.
++// Kept for future use when VerifyConnection is adopted.
++func peerAddr(conn net.Conn) string {
+
+- if conn == nil {
+- ```
+    return ""
+  ```
+- }
+- return conn.RemoteAddr().String()
+  +}
+- 
+
++// parseCertAndKey converts DER-encoded cert+key C buffers into a tls.Certificate.
++func parseCertAndKey(certPtr *C.uchar, certLen C.int, keyPtr *C.uchar, keyLen C.int) (*tls.Certificate, error) {
+
+- certDER := C.GoBytes(unsafe.Pointer(certPtr), certLen)
+- keyDER := C.GoBytes(unsafe.Pointer(keyPtr), keyLen)
+- cert, err := tls.X509KeyPair(certDER, keyDER)
+- if err != nil {
+- ```
+    return nil, errors.Wrap(err, "tlsplugin: parsing cert+key from plugin")
+  ```
+- }
+- return &cert, nil
+  +}
+  diff –git a/pkg/security/tlsplugin/BUILD.bazel b/pkg/security/tlsplugin/BUILD.bazel
+  new file mode 100644
+  — /dev/null
+  +++ b/pkg/security/tlsplugin/BUILD.bazel
+  @@ -0,0 +1,17 @@
+  +load(”@io_bazel_rules_go//go:def.bzl”, “go_library”)
+- 
+
++go_library(
+
+- name = “tlsplugin”,
+- srcs = [
+- ```
+     "plugin.go",
+  ```
+- ```
+     "plugin_cfg.go",
+  ```
+- ],
+- cgo = True,
+- clinkopts = [”-ldl”],
+- hdrs = [“abi.h”],
+- importpath = “github.com/cockroachdb/cockroach/pkg/security/tlsplugin”,
+- visibility = [”//visibility:public”],
+- deps = [
+- ```
+     "@com_github_cockroachdb_errors//:errors",
+  ```
+- ],
+  +)
+  diff –git a/pkg/base/config.go b/pkg/base/config.go
+  — a/pkg/base/config.go
+  +++ b/pkg/base/config.go
+  @@ -18,6 +18,7 @@ import (
+  “net”
+  “time”
+- “github.com/cockroachdb/cockroach/pkg/security/tlsplugin”
+  “github.com/cockroachdb/cockroach/pkg/security/username”
+  “github.com/cockroachdb/errors”
+  )
+  @@ -35,6 +36,14 @@ type Config struct {
+  // SSLCertsDir is the path to the certificate/key directory.
+  SSLCertsDir string
+- // TLSPlugin, when non-nil, delegates certificate provisioning and/or
+- // peer verification to an external shared library. See
+- // pkg/security/tlsplugin for details.
+- //
+- // When TLSPlugin.SkipCertsDir() is true (both hooks configured) the
+- // node may start without –certs-dir.
+- TLSPlugin *tlsplugin.TLSPluginConfig
+- // User running this process. It could be the user under which
+  // the server is running or the user passed in client calls.
+  User username.SQLUsername
+  diff –git a/pkg/cli/cliflags/flags.go b/pkg/cli/cliflags/flags.go
+  — a/pkg/cli/cliflags/flags.go
+  +++ b/pkg/cli/cliflags/flags.go
+  @@ -1,3 +1,33 @@
+  +// TLS plugin flags – append these to the existing flags.go file.
+- 
+
++// TLSPluginSo is the path to the TLS plugin shared library.
++var TLSPluginSo = FlagInfo{
+
+- Name: “tls-plugin-so”,
+- Description: `Path to an external shared library (.so) that provides TLS +certificate provisioning and/or peer verification hooks. Activates the plugin +when set. See pkg/security/tlsplugin/abi.h for the required C ABI.`,
+  +}
+- 
+
++// TLSPluginGetCert is the symbol name for the certificate provisioning hook.
++var TLSPluginGetCert = FlagInfo{
+
+- Name: “tls-plugin-get-cert”,
+- Description: `Symbol name in the TLS plugin library that implements certificate +provisioning (crdb_tls_get_cert_fn ABI). When set, node.crt and node.key are +not required on disk.`,
+  +}
+- 
+
++// TLSPluginVerifyCert is the symbol name for the peer verification hook.
++var TLSPluginVerifyCert = FlagInfo{
+
+- Name: “tls-plugin-verify-cert”,
+- Description: `Symbol name in the TLS plugin library that implements peer +certificate verification (crdb_tls_verify_cert_fn ABI). When set, ca.crt is +not required on disk and standard x509 chain validation is disabled in favour +of the plugin.`,
+  diff –git a/pkg/cli/flags.go b/pkg/cli/flags.go
+  — a/pkg/cli/flags.go
+  +++ b/pkg/cli/flags.go
+  @@ -25,6 +25,7 @@ import (
+  “github.com/cockroachdb/cockroach/pkg/cli/cliflags”
+  “github.com/cockroachdb/cockroach/pkg/roachpb”
+  “github.com/cockroachdb/cockroach/pkg/security”
+- “github.com/cockroachdb/cockroach/pkg/security/tlsplugin”
+  “github.com/cockroachdb/cockroach/pkg/security/username”
+  “github.com/cockroachdb/cockroach/pkg/server/telemetry”
+  “github.com/cockroachdb/cockroach/pkg/storage/storageconfig”
+  @@ -53,6 +54,13 @@ import (
+  var serverListenPort, serverSocketDir string
+  var serverAdvertiseAddr, serverAdvertisePort string
+  var serverSQLAddr, serverSQLPort string
+- 
+
++// tlsPlugin* hold the raw flag values; assembled into baseCfg.TLSPlugin
++// inside applyTLSPluginFlags() which is called from extraServerFlagInit.
++var tlsPluginSoPath string
++var tlsPluginGetCert string
++var tlsPluginVerifyCert string
++
+var serverSQLAdvertiseAddr, serverSQLAdvertisePort string
+var serverHTTPAddr, serverHTTPPort string
+var serverHTTPAdvertiseAddr, serverHTTPAdvertisePort string
+@@ -587,6 +595,11 @@ func init() {
+// Node cert subject alternate name (SAN)
+cliflagcfg.StringFlag(f, &startCtx.serverNodeCertSAN, cliflags.NodeCertSAN)
+
+- ```
+    // TLS plugin flags (all optional; plugin activates when --tls-plugin-so is set).
+  ```
+- ```
+    cliflagcfg.StringFlag(f, &tlsPluginSoPath, cliflags.TLSPluginSo)
+  ```
+- ```
+    cliflagcfg.StringFlag(f, &tlsPluginGetCert, cliflags.TLSPluginGetCert)
+  ```
+- ```
+    cliflagcfg.StringFlag(f, &tlsPluginVerifyCert, cliflags.TLSPluginVerifyCert)
+  ```
+- ```
+    // Cluster name verification.
+    cliflagcfg.VarFlag(f, clusterNameSetter{&baseCfg.ClusterName}, cliflags.ClusterName)
+    cliflagcfg.BoolFlag(f, &baseCfg.DisableClusterNameVerification, cliflags.DisableClusterNameVerification)
+  ```
+
+@@ -1198,6 +1211,32 @@ func extraServerFlagInit(cmd *cobra.Command) error {
+if err := security.SetCertPrincipalMap(startCtx.serverCertPrincipalMap); err != nil {
+return err
+}
++
+
+- // Assemble TLSPlugin config from –tls-plugin-* flags.
+- if err := applyTLSPluginFlags(); err != nil {
+- ```
+    return err
+  ```
+- }
+- 
+- // In secure mode, –certs-dir is required unless the plugin handles both
+- // cert provisioning and peer verification (in which case no file-based
+- // certs are read at all).
+- if !startCtx.serverInsecure {
+- ```
+    if startCtx.serverSSLCertsDir == "" &&
+  ```
+- ```
+    	(baseCfg.TLSPlugin == nil || !baseCfg.TLSPlugin.SkipCertsDir()) {
+  ```
+- ```
+    	return errors.New(
+  ```
+- ```
+    		"--certs-dir is required in secure mode; to omit it entirely " +
+  ```
+- ```
+    			"set both --tls-plugin-get-cert and --tls-plugin-verify-cert")
+  ```
+- ```
+    }
+  ```
+- }
+- if err := security.SetRootSubject(startCtx.serverRootCertDN); err != nil {
+  return err
+  }
+  @@ -1396,3 +1396,22 @@ func extraServerFlagInit(cmd *cobra.Command) error {
+  return nil
+  }
+
++// applyTLSPluginFlags assembles baseCfg.TLSPlugin from the three
++// –tls-plugin-* flag variables. Called from extraServerFlagInit.
++func applyTLSPluginFlags() error {
+
+- if tlsPluginSoPath == “” {
+- ```
+    return nil // no plugin configured
+  ```
+- }
+- cfg := &tlsplugin.TLSPluginConfig{}
+- cfg.SoPath = tlsPluginSoPath
+- cfg.Functions.GetCert = tlsPluginGetCert
+- cfg.Functions.VerifyCert = tlsPluginVerifyCert
+- if err := cfg.Validate(); err != nil {
+- ```
+    return err
+  ```
+- }
+- baseCfg.TLSPlugin = cfg
+- return nil
+  +}
+- 
+
+diff –git a/pkg/security/certificate_manager.go b/pkg/security/certificate_manager.go
+— a/pkg/security/certificate_manager.go
++++ b/pkg/security/certificate_manager.go
+@@ -13,6 +13,7 @@ import (
+“github.com/cockroachdb/cockroach/pkg/security/certnames”
+“github.com/cockroachdb/cockroach/pkg/security/clientcert”
+
+- “github.com/cockroachdb/cockroach/pkg/security/tlsplugin”
+  “github.com/cockroachdb/cockroach/pkg/security/username”
+  “github.com/cockroachdb/cockroach/pkg/settings”
+  @@ -56,7 +56,13 @@ type CertificateManager struct {
+  // The metrics struct is initialized at init time and metrics do their
+  // own locking.
+  certMetrics *Metrics
+- // tlsPlugin, when non-nil, indicates which file-based certs the plugin
+- // replaces. Set once via WithTLSPlugin(); immutable thereafter.
+- // Nil-safe via SkipNodeCert()/SkipCACert() methods on TLSPluginConfig.
+- tlsPlugin *tlsplugin.TLSPluginConfig
+- // Client cert expiration cache.
+  clientCertExpirationCache *clientcert.Cache
+
+@@ -160,6 +160,14 @@ func NewCertificateManagerFirstRun(
+return cm, cm.LoadCertificates()
+}
+
++// WithTLSPlugin attaches a TLS plugin config to the manager so it can
++// suppress “missing cert file” errors for whichever files the plugin
++// replaces. Must be called before the first use of the manager
++// (immediately after construction in rpc.NewContext).
++func (cm *CertificateManager) WithTLSPlugin(cfg *tlsplugin.TLSPluginConfig) {
+
+- cm.tlsPlugin = cfg
+  +}
+- 
+
+// IsForTenant returns true iff this certificate manager is handling certs
+// for a SQL-only server process.
+func (cm *CertificateManager) IsForTenant() bool {
+@@ -370,10 +370,14 @@ func (cm *CertificateManager) LoadCertificates() error {
+if cm.initialized {
+// If we ran before, make sure we don’t reload with missing/bad certificates.
+if err := checkCertIsValid(caCert); checkCertIsValid(cm.caCert) == nil && err != nil {
+
+- ```
+    	return makeErrorf(err, "reload would lose valid CA cert")
+  ```
+
+- ```
+    	if !cm.tlsPlugin.SkipCACert() {
+  ```
+- ```
+    		return makeErrorf(err, "reload would lose valid CA cert")
+  ```
+- ```
+    	}
+    }
+    if err := checkCertIsValid(nodeCert); checkCertIsValid(cm.nodeCert) == nil && err != nil {
+  ```
+
+- ```
+    	return makeErrorf(err, "reload would lose valid node cert")
+  ```
+
+- ```
+    	if !cm.tlsPlugin.SkipNodeCert() {
+  ```
+- ```
+    		return makeErrorf(err, "reload would lose valid node cert")
+  ```
+- ```
+    	}
+    }
+    if err := checkCertIsValid(nodeClientCert); checkCertIsValid(cm.nodeClientCert) == nil && err != nil {
+    	return makeErrorf(err, "reload would lose valid client cert for '%s'", username.NodeUser)
+  ```
+
+@@ -471,7 +471,14 @@ func (cm *CertificateManager) getEmbeddedServerTLSConfig(
+ca, err := cm.getCACertLocked()
+
+- if err != nil {
+- ```
+    return nil, err
+  ```
+- }
+
+- // When the plugin verifies peers, ca.crt need not exist on disk.
+- if err != nil && cm.tlsPlugin.SkipCACert() {
+- ```
+    err = nil
+  ```
+- ```
+    ca = &CertInfo{} // unused placeholder
+  ```
+- }
+- if err != nil {
+- ```
+    return nil, err
+  ```
+- }
+  
+  var nodeCert *CertInfo
+  if !cm.IsForTenant() {
+  // Host cluster.
+  nodeCert, err = cm.getNodeCertLocked()
+
+- ```
+    if err != nil {
+  ```
+- ```
+    	return nil, err
+  ```
+- ```
+    }
+  ```
+
+- ```
+    // When the plugin provides the local certificate, getNodeCertLocked
+  ```
+- ```
+    // may legitimately fail (no file on disk). Suppress it; the cert
+  ```
+- ```
+    // will be supplied at handshake time via tls.Config.GetCertificate.
+  ```
+- ```
+    if err != nil && cm.tlsPlugin.SkipNodeCert() {
+  ```
+- ```
+    	err = nil
+  ```
+- ```
+    	nodeCert = &CertInfo{} // unused placeholder
+  ```
+- ```
+    }
+  ```
+- ```
+    if err != nil {
+  ```
+- ```
+    	return nil, err
+  ```
+- ```
+    }
+  ```
+  
+  } else {
+  @@ -523,11 +523,25 @@ func (cm *CertificateManager) GetNodeClientTLSConfig() (*tls.Config, error) {
+  // Return the cached config if we have one.
+  if cm.clientConfig != nil {
+  return cm.clientConfig, nil
+  }
+  
+  ca, err := cm.getCACertLocked()
+
+- if err != nil {
+- ```
+    return nil, err
+  ```
+- }
+
+- // Plugin verifies peers -> ca.crt not required.
+- if err != nil && cm.tlsPlugin.SkipCACert() {
+- ```
+    err = nil
+  ```
+- ```
+    ca = &CertInfo{}
+  ```
+- }
+- if err != nil {
+- ```
+    return nil, err
+  ```
+- }
+  
+  clientCert, err := cm.getNodeClientCertLocked()
+
+- if err != nil {
+- ```
+    return nil, err
+  ```
+- }
+
+- // Plugin provides the local cert -> node client cert not required on disk.
+- if err != nil && cm.tlsPlugin.SkipNodeCert() {
+- ```
+    err = nil
+  ```
+- ```
+    clientCert = &CertInfo{}
+  ```
+- }
+- if err != nil {
+- ```
+    return nil, err
+  ```
+- }
+
+diff –git a/pkg/rpc/tls.go b/pkg/rpc/tls.go
+— a/pkg/rpc/tls.go
++++ b/pkg/rpc/tls.go
+@@ -22,6 +22,7 @@ import (
+“github.com/cockroachdb/cockroach/pkg/roachpb”
+“github.com/cockroachdb/cockroach/pkg/security”
+“github.com/cockroachdb/cockroach/pkg/security/certnames”
+
+- “github.com/cockroachdb/cockroach/pkg/security/tlsplugin”
+  “github.com/cockroachdb/cockroach/pkg/util/log”
+  “github.com/cockroachdb/cockroach/pkg/util/log/severity”
+  “github.com/cockroachdb/errors”
+  @@ -76,14 +76,20 @@ type SecurityContext struct {
+  type SecurityContext struct {
+  certnames.Locator
+  security.TLSSettings
+  config                 SecurityContextOptions
+- 
+- // tlsPlugin, when non-nil, injects certificate provisioning and/or peer
+- // verification hooks into tls.Config objects returned by GetServerTLSConfig
+- // and GetNodeClientTLSConfig. Set once in rpc.NewContext; immutable thereafter.
+- tlsPlugin *tlsplugin.TLSPlugin
+- tenID                  roachpb.TenantID
+  capabilitiesAuthorizer tenantcapabilities.Authorizer
+  lazy                   struct {
+  @@ -158,6 +158,19 @@ func (ctx *SecurityContext) GetServerTLSConfig() (*tls.Config, error) {
+  if err != nil {
+  return nil, wrapError(err)
+  }
+
+- return tlsCfg, nil
+
+- // Inject plugin hooks (no-op when ctx.tlsPlugin is nil).
+- ctx.tlsPlugin.InjectIntoTLSConfig(tlsCfg, false /* isInterNode */)
+- return tlsCfg, nil
+  +}
+- 
+
++// GetNodeClientTLSConfig returns the tls.Config for outgoing node-to-node
++// connections. isInterNode=true is forwarded to the plugin so it can apply
++// node-specific policy via tls_conn_info_t.is_inter_node.
++func (ctx *SecurityContext) GetNodeClientTLSConfig() (*tls.Config, error) {
+
+- if ctx.config.Insecure {
+- ```
+    return nil, nil
+  ```
+- }
+- cm, err := ctx.GetCertificateManager()
+- if err != nil {
+- ```
+    return nil, wrapError(err)
+  ```
+- }
+- tlsCfg, err := cm.GetNodeClientTLSConfig()
+- if err != nil {
+- ```
+    return nil, wrapError(err)
+  ```
+- }
+- ctx.tlsPlugin.InjectIntoTLSConfig(tlsCfg, true /* isInterNode */)
+- return tlsCfg, nil
+  }
+
+diff –git a/pkg/rpc/context.go b/pkg/rpc/context.go
+— a/pkg/rpc/context.go
++++ b/pkg/rpc/context.go
+@@ -24,6 +24,7 @@ import (
+“github.com/cockroachdb/cockroach/pkg/rpc/rpcbase”
+“github.com/cockroachdb/cockroach/pkg/security”
+“github.com/cockroachdb/cockroach/pkg/security/certnames”
+
+- “github.com/cockroachdb/cockroach/pkg/security/tlsplugin”
+  “github.com/cockroachdb/cockroach/pkg/security/username”
+  “github.com/cockroachdb/cockroach/pkg/settings”
+  @@ -428,6 +428,12 @@ type ContextOptions struct {
+  
+  // UseDRPC indicates if DRPC must be used for internode communication.
+  UseDRPC bool
+- 
+- // TLSPlugin, when non-nil, enables an external shared library to supply
+- // TLS certificates and/or verify peers. Propagated from base.Config.TLSPlugin
+- // via ServerContextOptionsFromBaseConfig.
+- TLSPlugin *tlsplugin.TLSPluginConfig
+  }
+
+// DefaultContextOptions are mostly used in tests.
+@@ -463,6 +463,7 @@ func ServerContextOptionsFromBaseConfig(cfg *base.Config) ContextOptions {
+DisableTLSForHTTP:              cfg.DisableTLSForHTTP,
+UseDRPC:                        cfg.UseDRPC,
+
+- ```
+    TLSPlugin:                      cfg.TLSPlugin,
+  ```
+  
+  }
+  }
+
+@@ -584,6 +584,26 @@ func NewContext(ctx context.Context, opts ContextOptions) *Context {
+)
+secCtx.useNodeAuth = opts.UseNodeAuth
+
+- // Load the TLS plugin. tlsplugin.Load is a no-op when opts.TLSPlugin is nil.
+- if opts.TLSPlugin != nil {
+- ```
+    plugin, err := tlsplugin.Load(opts.TLSPlugin)
+  ```
+- ```
+    if err != nil {
+  ```
+- ```
+    	panic(errors.Wrapf(err, "tlsplugin: failed to load %q", opts.TLSPlugin.SoPath))
+  ```
+- ```
+    }
+  ```
+- ```
+    // Store the loaded plugin on SecurityContext so GetServerTLSConfig
+  ```
+- ```
+    // and GetNodeClientTLSConfig can inject hooks at handshake time.
+  ```
+- ```
+    secCtx.tlsPlugin = plugin
+  ```
+- 
+- ```
+    // Attach the plugin config to the certificate manager so it can
+  ```
+- ```
+    // suppress "missing cert file" errors for whichever files the plugin
+  ```
+- ```
+    // replaces. GetCertificateManager initialises on first call; we call
+  ```
+- ```
+    // it now to force init before any TLS connections are attempted.
+  ```
+- ```
+    if cm, cmErr := secCtx.GetCertificateManager(); cmErr == nil {
+  ```
+- ```
+    	cm.WithTLSPlugin(opts.TLSPlugin)
+  ```
+- ```
+    }
+  ```
+- ```
+    // If cmErr != nil the error will surface naturally on the first TLS
+  ```
+- ```
+    // operation (GetServerTLSConfig etc.) -- not as a startup panic.
+  ```
+- }
+- rpcCtx := &Context{
+  ContextOptions:  opts,
+  SecurityContext: secCtx,
+
+# Notes
+
+1. Import deduplication in certificate_manager.go
+   The diff adds tlsplugin after the existing clientcert import at line 14.
+   Only add the tlsplugin line (clientcert already exists):
+   “github.com/cockroachdb/cockroach/pkg/security/tlsplugin”
+1. GetNodeClientTLSConfig already exists in certificate_manager.go
+   `(*CertificateManager).GetNodeClientTLSConfig` exists at line 519.
+   The new function in pkg/rpc/tls.go is `(*SecurityContext).GetNodeClientTLSConfig`
+   – a different receiver.
+1. extraServerFlagInit insertion order:
+   a) SetCertPrincipalMap   (existing)
+   b) applyTLSPluginFlags   (NEW)
+   c) needsCertsDir check   (NEW)
+   d) SetRootSubject        (existing)
+1. v6 line number corrections (verified against live master branch)
+   
+   pkg/cli/flags.go:
+   import:              @@ -25,6 +25,7 @@  (v3/v4/v5 had -19)
+   var declarations:    @@ -53,6 +54,13 @@  (v3/v4/v5 had -37)
+   flag registration:   @@ -563,6 +571,11 @@  (v3/v4/v5 had -344)
+   extraServerFlagInit: @@ -1198,6 +1211,32 @@  (v3/v4/v5 had -398)
+   applyTLSPluginFlags: @@ -1396,3 +1396,22 @@  (v3/v4/v5 had -436)
+   
+   pkg/rpc/tls.go:
+   import:              @@ -22,6 +22,7 @@  (v3/v4/v5 had -17)
+   struct field:        @@ -76,14 +76,20 @@ (with line-76 context)  (v3/v4/v5 had -71)
+   GetServerTLSConfig:  @@ -158,6 +158,19 @@  (v3/v4/v5 had -115)
+   
+   pkg/security/certificate_manager.go: unchanged from v5
+   pkg/rpc/context.go: unchanged from v5
+1. Gramine RA-TLS shim example
+   
+   cockroach start   
+   –tls-plugin-so=/opt/gramine/lib/ra_tls_shim.so   
+   –tls-plugin-get-cert=crdb_get_cert   
+   –tls-plugin-verify-cert=crdb_verify_cert   
+   –advertise-addr=<host>   
+   –join=<peers>   
+   –store=<path>
