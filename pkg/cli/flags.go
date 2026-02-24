@@ -25,6 +25,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cli/cliflags"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/tlsplugin"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/storage/storageconfig"
@@ -53,6 +54,13 @@ import (
 var serverListenPort, serverSocketDir string
 var serverAdvertiseAddr, serverAdvertisePort string
 var serverSQLAddr, serverSQLPort string
+
+// tlsPlugin* hold the raw flag values; assembled into baseCfg.TLSPlugin
+// inside applyTLSPluginFlags() which is called from extraServerFlagInit.
+var tlsPluginSoPath string
+var tlsPluginGetCert string
+var tlsPluginVerifyCert string
+
 var serverSQLAdvertiseAddr, serverSQLAdvertisePort string
 var serverHTTPAddr, serverHTTPPort string
 var serverHTTPAdvertiseAddr, serverHTTPAdvertisePort string
@@ -586,6 +594,11 @@ func init() {
 
 		// Node cert subject alternate name (SAN)
 		cliflagcfg.StringFlag(f, &startCtx.serverNodeCertSAN, cliflags.NodeCertSAN)
+
+		// TLS plugin flags (all optional; plugin activates when --tls-plugin-so is set).
+		cliflagcfg.StringFlag(f, &tlsPluginSoPath, cliflags.TLSPluginSo)
+		cliflagcfg.StringFlag(f, &tlsPluginGetCert, cliflags.TLSPluginGetCert)
+		cliflagcfg.StringFlag(f, &tlsPluginVerifyCert, cliflags.TLSPluginVerifyCert)
 
 		// Cluster name verification.
 		cliflagcfg.VarFlag(f, clusterNameSetter{&baseCfg.ClusterName}, cliflags.ClusterName)
@@ -1197,6 +1210,21 @@ func extraServerFlagInit(cmd *cobra.Command) error {
 	if err := security.SetCertPrincipalMap(startCtx.serverCertPrincipalMap); err != nil {
 		return err
 	}
+	// Assemble TLSPlugin config from --tls-plugin-* flags.
+	if err := applyTLSPluginFlags(); err != nil {
+		return err
+	}
+	// In secure mode, --certs-dir is required unless the plugin handles both
+	// cert provisioning and peer verification (in which case no file-based
+	// certs are read at all).
+	if !startCtx.serverInsecure {
+		if startCtx.serverSSLCertsDir == "" &&
+			(baseCfg.TLSPlugin == nil || !baseCfg.TLSPlugin.SkipCertsDir()) {
+			return errors.New(
+				"--certs-dir is required in secure mode; to omit it entirely " +
+					"set both --tls-plugin-get-cert and --tls-plugin-verify-cert")
+		}
+	}
 	if err := security.SetRootSubject(startCtx.serverRootCertDN); err != nil {
 		return err
 	}
@@ -1594,3 +1622,20 @@ func (sv *sizeFlagVal) Set(value string) error {
 // package rather than the cliccl package to defeat the duplicate envvar
 // registration logic.
 func RegisterFlags(f func()) { f() }
+
+// applyTLSPluginFlags assembles baseCfg.TLSPlugin from the three
+// --tls-plugin-* flag variables. Called from extraServerFlagInit.
+func applyTLSPluginFlags() error {
+	if tlsPluginSoPath == "" {
+		return nil // no plugin configured
+	}
+	cfg := &tlsplugin.TLSPluginConfig{}
+	cfg.SoPath = tlsPluginSoPath
+	cfg.Functions.GetCert = tlsPluginGetCert
+	cfg.Functions.VerifyCert = tlsPluginVerifyCert
+	if err := cfg.Validate(); err != nil {
+		return err
+	}
+	baseCfg.TLSPlugin = cfg
+	return nil
+}

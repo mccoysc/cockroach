@@ -24,6 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/rpc/rpcbase"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/security/certnames"
+	"github.com/cockroachdb/cockroach/pkg/security/tlsplugin"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
@@ -428,6 +429,11 @@ type ContextOptions struct {
 
 	// UseDRPC indicates if DRPC must be used for internode communication.
 	UseDRPC bool
+
+	// TLSPlugin, when non-nil, enables an external shared library to supply
+	// TLS certificates and/or verify peers. Propagated from base.Config.TLSPlugin
+	// via ServerContextOptionsFromBaseConfig.
+	TLSPlugin *tlsplugin.TLSPluginConfig
 }
 
 // DefaultContextOptions are mostly used in tests.
@@ -462,6 +468,7 @@ func ServerContextOptionsFromBaseConfig(cfg *base.Config) ContextOptions {
 		SQLAdvertiseAddrH:              &cfg.SQLAdvertiseAddrH,
 		DisableTLSForHTTP:              cfg.DisableTLSForHTTP,
 		UseDRPC:                        cfg.UseDRPC,
+		TLSPlugin:                      cfg.TLSPlugin,
 	}
 }
 
@@ -583,6 +590,27 @@ func NewContext(ctx context.Context, opts ContextOptions) *Context {
 		opts.TenantRPCAuthorizer,
 	)
 	secCtx.useNodeAuth = opts.UseNodeAuth
+
+	// Load the TLS plugin. tlsplugin.Load is a no-op when opts.TLSPlugin is nil.
+	if opts.TLSPlugin != nil {
+		plugin, err := tlsplugin.Load(opts.TLSPlugin)
+		if err != nil {
+			panic(errors.Wrapf(err, "tlsplugin: failed to load %q", opts.TLSPlugin.SoPath))
+		}
+		// Store the loaded plugin on SecurityContext so GetServerTLSConfig
+		// and GetNodeClientTLSConfig can inject hooks at handshake time.
+		secCtx.tlsPlugin = plugin
+
+		// Attach the plugin config to the certificate manager so it can
+		// suppress "missing cert file" errors for whichever files the plugin
+		// replaces. GetCertificateManager initialises on first call; we call
+		// it now to force init before any TLS connections are attempted.
+		if cm, cmErr := secCtx.GetCertificateManager(); cmErr == nil {
+			cm.WithTLSPlugin(opts.TLSPlugin)
+		}
+		// If cmErr != nil the error will surface naturally on the first TLS
+		// operation (GetServerTLSConfig etc.) -- not as a startup panic.
+	}
 
 	rpcCtx := &Context{
 		ContextOptions:  opts,

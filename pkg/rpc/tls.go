@@ -22,6 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/security/certnames"
+	"github.com/cockroachdb/cockroach/pkg/security/tlsplugin"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/log/severity"
 	"github.com/cockroachdb/errors"
@@ -77,6 +78,10 @@ type SecurityContext struct {
 	certnames.Locator
 	security.TLSSettings
 	config                 SecurityContextOptions
+	// tlsPlugin, when non-nil, injects certificate provisioning and/or peer
+	// verification hooks into tls.Config objects returned by GetServerTLSConfig
+	// and GetNodeClientTLSConfig. Set once in rpc.NewContext; immutable thereafter.
+	tlsPlugin              *tlsplugin.TLSPlugin
 	tenID                  roachpb.TenantID
 	capabilitiesAuthorizer tenantcapabilities.Authorizer
 	lazy                   struct {
@@ -158,6 +163,27 @@ func (ctx *SecurityContext) GetServerTLSConfig() (*tls.Config, error) {
 	if err != nil {
 		return nil, wrapError(err)
 	}
+	// Inject plugin hooks (no-op when ctx.tlsPlugin is nil).
+	ctx.tlsPlugin.InjectIntoTLSConfig(tlsCfg, false /* isInterNode */)
+	return tlsCfg, nil
+}
+
+// GetNodeClientTLSConfig returns the tls.Config for outgoing node-to-node
+// connections. isInterNode=true is forwarded to the plugin so it can apply
+// node-specific policy via tls_conn_info_t.is_inter_node.
+func (ctx *SecurityContext) GetNodeClientTLSConfig() (*tls.Config, error) {
+	if ctx.config.Insecure {
+		return nil, nil
+	}
+	cm, err := ctx.GetCertificateManager()
+	if err != nil {
+		return nil, wrapError(err)
+	}
+	tlsCfg, err := cm.GetNodeClientTLSConfig()
+	if err != nil {
+		return nil, wrapError(err)
+	}
+	ctx.tlsPlugin.InjectIntoTLSConfig(tlsCfg, true /* isInterNode */)
 	return tlsCfg, nil
 }
 

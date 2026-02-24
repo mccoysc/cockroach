@@ -1,0 +1,18 @@
+load("@io_bazel_rules_go//go:def.bzl", "go_library")
+
+go_library(
+    name = "tlsplugin",
+    srcs = [
+        "plugin.go",
+        "plugin_cfg.go",
+        "plugin_stub.go",
+    ],
+    cgo = True,
+    clinkopts = ["-ldl"],
+    hdrs = ["abi.h"],
+    importpath = "github.com/cockroachdb/cockroach/pkg/security/tlsplugin",
+    visibility = ["//visibility:public"],
+    deps = [
+        "@com_github_cockroachdb_errors//:errors",
+    ],
+)
