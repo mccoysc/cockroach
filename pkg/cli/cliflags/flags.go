@@ -2156,4 +2156,32 @@ example:
   --enterprise-encryption=path=cockroach-data,key=/keys/aes-128.key,old-key=plain</PRE>
 `,
 	}
+
+	// TLSPluginSo is the path to the TLS plugin shared library.
+	TLSPluginSo = FlagInfo{
+		Name: "tls-plugin-so",
+		Description: `
+Path to an external shared library (.so) that provides TLS certificate
+provisioning and/or peer verification hooks. Activates the plugin when set.
+See pkg/security/tlsplugin/abi.h for the required C ABI.`,
+	}
+
+	// TLSPluginGetCert is the symbol name for the certificate provisioning hook.
+	TLSPluginGetCert = FlagInfo{
+		Name: "tls-plugin-get-cert",
+		Description: `
+Symbol name in the TLS plugin library that implements certificate provisioning
+(crdb_tls_get_cert_fn ABI). When set, node.crt and node.key are not required
+on disk.`,
+	}
+
+	// TLSPluginVerifyCert is the symbol name for the peer verification hook.
+	TLSPluginVerifyCert = FlagInfo{
+		Name: "tls-plugin-verify-cert",
+		Description: `
+Symbol name in the TLS plugin library that implements peer certificate
+verification (crdb_tls_verify_cert_fn ABI). When set, ca.crt is not required
+on disk and standard x509 chain validation is disabled in favour of the
+plugin.`,
+	}
 )

@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/security/tlsplugin"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage/storageconfig"
@@ -397,6 +398,14 @@ type Config struct {
 	SSLCAKey string
 	// SSLCertsDir is the path to the certificate/key directory.
 	SSLCertsDir string
+
+	// TLSPlugin, when non-nil, delegates certificate provisioning and/or
+	// peer verification to an external shared library. See
+	// pkg/security/tlsplugin for details.
+	//
+	// When TLSPlugin.SkipCertsDir() is true (both hooks configured) the
+	// node may start without --certs-dir.
+	TLSPlugin *tlsplugin.TLSPluginConfig
 
 	// User running this process. It could be the user under which
 	// the server is running or the user passed in client calls.

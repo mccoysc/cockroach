@@ -12,6 +12,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/security/certnames"
 	"github.com/cockroachdb/cockroach/pkg/security/clientcert"
+	"github.com/cockroachdb/cockroach/pkg/security/tlsplugin"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
@@ -56,6 +57,11 @@ type CertificateManager struct {
 	// The metrics struct is initialized at init time and metrics do their
 	// own locking.
 	certMetrics *Metrics
+
+	// tlsPlugin, when non-nil, indicates which file-based certs the plugin
+	// replaces. Set once via WithTLSPlugin(); immutable thereafter.
+	// Nil-safe via SkipNodeCert()/SkipCACert() methods on TLSPluginConfig.
+	tlsPlugin *tlsplugin.TLSPluginConfig
 
 	// Client cert expiration cache.
 	clientCertExpirationCache *clientcert.Cache
@@ -158,6 +164,14 @@ func NewCertificateManagerFirstRun(
 	}
 
 	return cm, cm.LoadCertificates()
+}
+
+// WithTLSPlugin attaches a TLS plugin config to the manager so it can
+// suppress "missing cert file" errors for whichever files the plugin
+// replaces. Must be called before the first use of the manager
+// (immediately after construction in rpc.NewContext).
+func (cm *CertificateManager) WithTLSPlugin(cfg *tlsplugin.TLSPluginConfig) {
+	cm.tlsPlugin = cfg
 }
 
 // IsForTenant returns true iff this certificate manager is handling certs
@@ -370,10 +384,14 @@ func (cm *CertificateManager) LoadCertificates() error {
 	if cm.initialized {
 		// If we ran before, make sure we don't reload with missing/bad certificates.
 		if err := checkCertIsValid(caCert); checkCertIsValid(cm.caCert) == nil && err != nil {
-			return makeErrorf(err, "reload would lose valid CA cert")
+			if !cm.tlsPlugin.SkipCACert() {
+				return makeErrorf(err, "reload would lose valid CA cert")
+			}
 		}
 		if err := checkCertIsValid(nodeCert); checkCertIsValid(cm.nodeCert) == nil && err != nil {
-			return makeErrorf(err, "reload would lose valid node cert")
+			if !cm.tlsPlugin.SkipNodeCert() {
+				return makeErrorf(err, "reload would lose valid node cert")
+			}
 		}
 		if err := checkCertIsValid(nodeClientCert); checkCertIsValid(cm.nodeClientCert) == nil && err != nil {
 			return makeErrorf(err, "reload would lose valid client cert for '%s'", username.NodeUser)
@@ -469,6 +487,11 @@ func (cm *CertificateManager) getEmbeddedServerTLSConfig(
 	}
 
 	ca, err := cm.getCACertLocked()
+	// When the plugin verifies peers, ca.crt need not exist on disk.
+	if err != nil && cm.tlsPlugin.SkipCACert() {
+		err = nil
+		ca = &CertInfo{} // unused placeholder
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -477,6 +500,13 @@ func (cm *CertificateManager) getEmbeddedServerTLSConfig(
 	if !cm.IsForTenant() {
 		// Host cluster.
 		nodeCert, err = cm.getNodeCertLocked()
+		// When the plugin provides the local certificate, getNodeCertLocked
+		// may legitimately fail (no file on disk). Suppress it; the cert
+		// will be supplied at handshake time via tls.Config.GetCertificate.
+		if err != nil && cm.tlsPlugin.SkipNodeCert() {
+			err = nil
+			nodeCert = &CertInfo{} // unused placeholder
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -526,11 +556,21 @@ func (cm *CertificateManager) GetNodeClientTLSConfig() (*tls.Config, error) {
 	}
 
 	ca, err := cm.getCACertLocked()
+	// Plugin verifies peers -> ca.crt not required.
+	if err != nil && cm.tlsPlugin.SkipCACert() {
+		err = nil
+		ca = &CertInfo{}
+	}
 	if err != nil {
 		return nil, err
 	}
 
 	clientCert, err := cm.getNodeClientCertLocked()
+	// Plugin provides the local cert -> node client cert not required on disk.
+	if err != nil && cm.tlsPlugin.SkipNodeCert() {
+		err = nil
+		clientCert = &CertInfo{}
+	}
 	if err != nil {
 		return nil, err
 	}

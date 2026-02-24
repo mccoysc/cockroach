@@ -91,20 +91,23 @@ func newUIClientTLSConfig(settings TLSSettings, caPEM []byte) (*tls.Config, erro
 
 // newBaseTLSConfigWithCertificate returns a tls.Config initialized with the
 // passed-in certificate and optional CA certificate.
+// When both certPEM and keyPEM are nil, no static certificate is added;
+// the caller is expected to supply GetCertificate/GetClientCertificate instead.
 func newBaseTLSConfigWithCertificate(
 	settings TLSSettings, certPEM, keyPEM, caPEM []byte,
 ) (*tls.Config, error) {
-	cert, err := tls.X509KeyPair(certPEM, keyPEM)
-	if err != nil {
-		return nil, err
-	}
-
 	cfg, err := newBaseTLSConfig(settings, caPEM)
 	if err != nil {
 		return nil, err
 	}
 
-	cfg.Certificates = []tls.Certificate{cert}
+	if certPEM != nil || keyPEM != nil {
+		cert, err := tls.X509KeyPair(certPEM, keyPEM)
+		if err != nil {
+			return nil, err
+		}
+		cfg.Certificates = []tls.Certificate{cert}
+	}
 	return cfg, nil
 }
 
