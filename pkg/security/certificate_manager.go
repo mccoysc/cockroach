@@ -519,22 +519,39 @@ func (cm *CertificateManager) getEmbeddedServerTLSConfig(
 	}
 
 	clientCA, err := cm.getClientCACertLocked()
+	// When the plugin verifies peers, the client CA cert need not exist on disk.
+	if err != nil && cm.tlsPlugin.SkipCACert() {
+		err = nil
+		clientCA = &CertInfo{}
+	}
 	if err != nil {
 		return nil, err
 	}
 
 	tenantCA, err := cm.getTenantCACertLocked()
+	// When the plugin verifies peers, the tenant CA cert need not exist on disk.
+	if err != nil && cm.tlsPlugin.SkipCACert() {
+		err = nil
+		tenantCA = &CertInfo{}
+	}
 	if err != nil {
 		return nil, err
 	}
 
+	// Filter out nil (not-configured) CA PEMs so that newServerTLSConfig does
+	// not attempt to parse them and fail.
+	var clientCAPEMs [][]byte
+	for _, caPEM := range [][]byte{clientCA.FileContents, tenantCA.FileContents} {
+		if len(caPEM) > 0 {
+			clientCAPEMs = append(clientCAPEMs, caPEM)
+		}
+	}
 	cfg, err := newServerTLSConfig(
 		cm.tlsSettings,
 		nodeCert.FileContents,
 		nodeCert.KeyFileContents,
 		ca.FileContents,
-		clientCA.FileContents,
-		tenantCA.FileContents,
+		clientCAPEMs...,
 	)
 	if err != nil {
 		return nil, err

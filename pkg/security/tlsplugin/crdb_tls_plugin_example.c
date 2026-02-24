@@ -43,6 +43,11 @@ CRDB_TLS_GET_CERT_PROTO(my_get_cert)
      * Allocate *cert_out and *key_out with malloc() (or any allocator whose
      * free function you export as crdb_tls_free_buf below).
      * CockroachDB calls crdb_tls_free_buf() on both buffers after use.
+     *
+     * Return values:
+     *   0                  – success; cert/key are in *cert_out / *key_out
+     *   CRDB_TLS_FALLBACK  – fall back to the --certs-dir certificate
+     *   any other non-zero – abort the TLS handshake
      */
 
     /* TODO: replace with real certificate retrieval logic. */
@@ -53,7 +58,7 @@ CRDB_TLS_GET_CERT_PROTO(my_get_cert)
 
     *cert_out = NULL; *cert_len = 0;
     *key_out  = NULL; *key_len  = 0;
-    return 1; /* non-zero => abort handshake until implemented */
+    return CRDB_TLS_FALLBACK; /* fall back to --certs-dir cert until implemented */
 }
 
 
@@ -62,9 +67,9 @@ CRDB_TLS_GET_CERT_PROTO(my_get_cert)
  *   Registered via --tls-plugin-verify-cert my_verify_cert
  * -------------------------------------------------------------------------
  *
- * NOTE: When this hook is configured, CockroachDB sets InsecureSkipVerify=true
- * and delegates ALL trust decisions to this function.  You MUST implement
- * proper verification here.
+ * NOTE: When this hook is configured, CockroachDB makes the plugin the
+ * primary trust authority.  Standard x509 chain validation is used only
+ * if the hook returns CRDB_TLS_FALLBACK and a CA file is configured.
  */
 CRDB_TLS_VERIFY_CERT_PROTO(my_verify_cert)
 {
@@ -78,7 +83,10 @@ CRDB_TLS_VERIFY_CERT_PROTO(my_verify_cert)
      * conn_info->tls_version  = negotiated TLS version (e.g. 0x0304 = TLS 1.3)
      * conn_info->is_inter_node = 1 for node-to-node RPC connections
      *
-     * Return 0 to accept the peer, non-zero to reject.
+     * Return values:
+     *   0                  – accept the peer
+     *   CRDB_TLS_FALLBACK  – fall back to standard x509 + --certs-dir CA
+     *   any other non-zero – reject the peer
      */
 
     /* TODO: replace with real verification logic. */
@@ -87,7 +95,7 @@ CRDB_TLS_VERIFY_CERT_PROTO(my_verify_cert)
             conn_info->peer_addr ? conn_info->peer_addr : "",
             (int)conn_info->is_inter_node);
 
-    return 1; /* non-zero => reject peer until implemented */
+    return CRDB_TLS_FALLBACK; /* fall back to CA file verification until implemented */
 }
 
 

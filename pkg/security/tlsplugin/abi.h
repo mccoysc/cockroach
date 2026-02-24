@@ -14,12 +14,35 @@
  * Buffers passed OUT (cert_out, key_out) must be allocated by the plugin
  * with its own allocator and will be released via crdb_tls_free_buf.
  *
- * Return value convention: 0 = success/trusted, non-zero = error/rejected.
+ * Return value convention
+ * -----------------------
+ * Every hook returns an int that signals one of two actions:
+ *
+ *   0                  – "use as-is": the hook succeeded; use the result
+ *                        (cert/key pair for get-cert; accept the peer for
+ *                        verify-cert).
+ *
+ *   CRDB_TLS_FALLBACK  – "fallback": the hook could not produce a result;
+ *                        CockroachDB falls back to the file-based
+ *                        CA/certificate/key configured via --certs-dir (if
+ *                        any).  If no fallback is configured the connection
+ *                        is aborted.
+ *
+ *   any other non-zero – "use as-is": the hook explicitly failed; abort the
+ *                        TLS handshake with an error.
  */
 #ifndef COCKROACH_TLS_PLUGIN_ABI_H
 #define COCKROACH_TLS_PLUGIN_ABI_H
 
 #include <stdint.h>
+
+/*
+ * CRDB_TLS_FALLBACK
+ * Returned by a hook to signal that CockroachDB should use the file-based
+ * fallback (CA/certificate/key loaded from --certs-dir).  If no fallback is
+ * configured the connection is aborted.
+ */
+#define CRDB_TLS_FALLBACK (-1)
 
 #ifdef __cplusplus
 extern "C" {
@@ -64,7 +87,8 @@ typedef struct {
  *
  * When this hook is configured the plugin MUST also export crdb_tls_free_buf.
  *
- * Returns 0 on success, non-zero to abort the handshake.
+ * Returns 0 on success.  Returns CRDB_TLS_FALLBACK to use the file-based
+ * fallback certificate.  Any other non-zero value aborts the handshake.
  */
 typedef int (*crdb_tls_get_cert_fn)(
     const tls_conn_info_t *conn_info,
@@ -84,7 +108,9 @@ typedef int (*crdb_tls_get_cert_fn)(
  * cert_lens is a parallel array of byte lengths.
  * All cert buffers are owned by CockroachDB; do not free or retain them.
  *
- * Returns 0 if the peer is trusted, non-zero to abort the handshake.
+ * Returns 0 if the peer is trusted.  Returns CRDB_TLS_FALLBACK to fall back
+ * to standard x509 chain verification using the configured CA file.  Any
+ * other non-zero value aborts the handshake.
  */
 typedef int (*crdb_tls_verify_cert_fn)(
     const tls_conn_info_t        *conn_info,
@@ -122,13 +148,15 @@ typedef void (*crdb_tls_free_buf_fn)(void *ptr);
  *   CRDB_TLS_GET_CERT_PROTO(my_get_cert) {
  *       // fill *cert_out / *cert_len / *key_out / *key_len with DER data
  *       // allocated by malloc(); CockroachDB will call crdb_tls_free_buf.
- *       return 0; // 0 = success
+ *       return 0;                // 0 = success, use this cert
+ *       // return CRDB_TLS_FALLBACK; // fall back to --certs-dir cert
  *   }
  *
  *   // Implement Hook 2 – called to verify the peer's certificate chain.
  *   CRDB_TLS_VERIFY_CERT_PROTO(my_verify_cert) {
  *       // inspect raw_certs[0..n_certs-1] (DER bytes, lengths in cert_lens)
- *       return 0; // 0 = trusted
+ *       return 0;                // 0 = trusted
+ *       // return CRDB_TLS_FALLBACK; // fall back to --certs-dir CA verification
  *   }
  *
  *   // Implement Hook 3 – MUST be exported as the fixed symbol name below.

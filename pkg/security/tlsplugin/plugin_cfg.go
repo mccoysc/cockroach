@@ -13,6 +13,11 @@ import "github.com/cockroachdb/errors"
 // The config is entirely optional. When base.Config.TLSPlugin is nil the
 // standard CockroachDB certificate-manager path is used unchanged.
 //
+// Plugin hooks and file-based certs can be configured simultaneously: if a
+// hook returns CRDB_TLS_FALLBACK, CockroachDB falls back to the file-based
+// CA/certificate/key loaded from --certs-dir. If no fallback is configured
+// the connection is aborted.
+//
 // CLI flags:
 //
 //	--tls-plugin-so           path to the shared library (.so)
@@ -21,8 +26,8 @@ import "github.com/cockroachdb/errors"
 //
 // Effect on certificate file requirements:
 //
-//	get-cert configured    => node.crt and node.key are not read from disk
-//	verify-cert configured => ca.crt is not read from disk
+//	get-cert configured    => node.crt and node.key are not required on disk
+//	verify-cert configured => ca.crt is not required on disk
 //	both configured        => --certs-dir may be absent entirely
 type TLSPluginConfig struct {
 	// SoPath is the filesystem path of the shared library to dlopen.
@@ -58,14 +63,17 @@ func (c *TLSPluginConfig) Validate() error {
 }
 
 // SkipNodeCert reports whether node.crt/node.key are not required on disk
-// (because the plugin provides the local certificate).
+// (because the plugin provides the local certificate). If cert files are
+// present they are loaded and used as a fallback when the hook returns
+// CRDB_TLS_FALLBACK.
 // Safe to call on a nil receiver (returns false).
 func (c *TLSPluginConfig) SkipNodeCert() bool {
 	return c != nil && c.Functions.GetCert != ""
 }
 
 // SkipCACert reports whether ca.crt is not required on disk (because the
-// plugin performs peer verification itself).
+// plugin performs peer verification itself). If a CA file is present it is
+// loaded and used as a fallback when the hook returns CRDB_TLS_FALLBACK.
 // Safe to call on a nil receiver (returns false).
 func (c *TLSPluginConfig) SkipCACert() bool {
 	return c != nil && c.Functions.VerifyCert != ""
