@@ -1609,18 +1609,27 @@ func (rpcCtx *Context) GetClientTLSConfig() (*tls.Config, error) {
 	case rpcCtx.ClientOnly:
 		// A CLI command is performing a remote RPC.
 		tlsCfg, err := cm.GetClientTLSConfig(rpcCtx.User)
-		return tlsCfg, wrapError(err)
+		if err != nil {
+			return nil, wrapError(err)
+		}
+		rpcCtx.tlsPlugin.InjectIntoTLSConfig(tlsCfg, tlsplugin.ConnTypeClientRPC)
+		return tlsCfg, nil
 
 	case rpcCtx.UseNodeAuth || rpcCtx.tenID.IsSystem():
-		tlsCfg, err := cm.GetNodeClientTLSConfig()
-		return tlsCfg, wrapError(err)
+		// Route through SecurityContext.GetNodeClientTLSConfig which already
+		// injects the plugin with ConnTypeClientNode.
+		return rpcCtx.GetNodeClientTLSConfig()
 
 	case !rpcCtx.tenID.IsSystem():
 		// A SQL server running in a standalone server doesn't have access
 		// to the node certs, and thus must use the standalone tenant
 		// client cert.
 		tlsCfg, err := cm.GetTenantTLSConfig()
-		return tlsCfg, wrapError(err)
+		if err != nil {
+			return nil, wrapError(err)
+		}
+		rpcCtx.tlsPlugin.InjectIntoTLSConfig(tlsCfg, tlsplugin.ConnTypeClientTenant)
+		return tlsCfg, nil
 
 	default:
 		// We don't currently support any other way to use the rpc context.

@@ -49,6 +49,32 @@ extern "C" {
 #endif
 
 /*
+ * conn_type values for tls_conn_info_t.conn_type
+ * ------------------------------------------------
+ * Identifies the exact business-logic call site that triggered the TLS
+ * handshake so hook functions can apply per-context policy.
+ *
+ * Server-side types (CockroachDB is accepting an inbound TLS connection):
+ *   CRDB_TLS_CONN_SERVER_RPC   – gRPC/SQL server accepting a node or client
+ *                                connection (node.crt / ca.crt path).
+ *   CRDB_TLS_CONN_SERVER_UI    – Admin UI HTTPS server (ui.crt path).
+ *
+ * Client-side types (CockroachDB is initiating an outbound TLS connection):
+ *   CRDB_TLS_CONN_CLIENT_NODE  – node-to-node gRPC dial (node client cert).
+ *   CRDB_TLS_CONN_CLIENT_TENANT– tenant SQL server dialing a KV node
+ *                                (tenant client cert).
+ *   CRDB_TLS_CONN_CLIENT_UI    – Admin UI reverse-proxy HTTP client.
+ *   CRDB_TLS_CONN_CLIENT_RPC   – CLI or other RPC client dialing a server
+ *                                (user client cert, e.g. root.crt).
+ */
+#define CRDB_TLS_CONN_SERVER_RPC    ((uint8_t)1)
+#define CRDB_TLS_CONN_SERVER_UI     ((uint8_t)2)
+#define CRDB_TLS_CONN_CLIENT_NODE   ((uint8_t)3)
+#define CRDB_TLS_CONN_CLIENT_TENANT ((uint8_t)4)
+#define CRDB_TLS_CONN_CLIENT_UI     ((uint8_t)5)
+#define CRDB_TLS_CONN_CLIENT_RPC    ((uint8_t)6)
+
+/*
  * tls_conn_info_t – connection context passed to every hook.
  * Fields are NULL/0 when information is unavailable (e.g. peer_addr is ""
  * inside VerifyPeerCertificate because Go's crypto/tls does not expose
@@ -65,10 +91,10 @@ typedef struct {
      */
     uint16_t tls_version;
     /*
-     * 1 = intra-cluster node-to-node RPC connection.
-     * 0 = external SQL/HTTP client connection.
+     * Identifies the call site that triggered this TLS handshake.
+     * One of the CRDB_TLS_CONN_* constants above.
      */
-    uint8_t is_inter_node;
+    uint8_t conn_type;
     /* Opaque NUL-terminated connection ID for log correlation. */
     const char *conn_id;
 } tls_conn_info_t;
@@ -146,6 +172,7 @@ typedef void (*crdb_tls_free_buf_fn)(void *ptr);
  *
  *   // Implement Hook 1 – called on every TLS handshake that needs a cert.
  *   CRDB_TLS_GET_CERT_PROTO(my_get_cert) {
+ *       // conn_info->conn_type is one of CRDB_TLS_CONN_* (see above).
  *       // fill *cert_out / *cert_len / *key_out / *key_len with DER data
  *       // allocated by malloc(); CockroachDB will call crdb_tls_free_buf.
  *       return 0;                // 0 = success, use this cert
@@ -154,6 +181,7 @@ typedef void (*crdb_tls_free_buf_fn)(void *ptr);
  *
  *   // Implement Hook 2 – called to verify the peer's certificate chain.
  *   CRDB_TLS_VERIFY_CERT_PROTO(my_verify_cert) {
+ *       // conn_info->conn_type is one of CRDB_TLS_CONN_* (see above).
  *       // inspect raw_certs[0..n_certs-1] (DER bytes, lengths in cert_lens)
  *       return 0;                // 0 = trusted
  *       // return CRDB_TLS_FALLBACK; // fall back to --certs-dir CA verification

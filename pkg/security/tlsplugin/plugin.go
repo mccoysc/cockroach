@@ -137,22 +137,20 @@ func dlsym(handle unsafe.Pointer, name string) (unsafe.Pointer, error) {
 }
 
 // InjectIntoTLSConfig wires the plugin hooks into tlsCfg.
-// isInterNode is forwarded to the plugin via tls_conn_info_t.is_inter_node.
+// connType identifies the call site and is forwarded to every hook via
+// tls_conn_info_t.conn_type.
 // No-op when the receiver is nil or tlsCfg is nil.
 //
 // For configs that use GetConfigForClient (server-side), the hooks are
 // injected into each per-connection inner config returned by the callback.
 // The inner config's existing certificates (loaded from disk) serve as the
 // fallback when a hook returns CRDB_TLS_FALLBACK.
-func (p *TLSPlugin) InjectIntoTLSConfig(tlsCfg *tls.Config, isInterNode bool) {
+func (p *TLSPlugin) InjectIntoTLSConfig(tlsCfg *tls.Config, connType ConnType) {
 	if p == nil || tlsCfg == nil {
 		return
 	}
 
-	interNodeBit := C.uint8_t(0)
-	if isInterNode {
-		interNodeBit = 1
-	}
+	cConnType := C.uint8_t(connType)
 
 	// For server-side configs, GetConfigForClient returns a per-connection inner
 	// config that holds the actual loaded certificates. Wrap the callback so the
@@ -174,7 +172,7 @@ func (p *TLSPlugin) InjectIntoTLSConfig(tlsCfg *tls.Config, isInterNode bool) {
 			if inner != lastInner {
 				// New inner config (first call or after certificate reload).
 				// Inject plugin hooks once into this config.
-				p.injectDirect(inner, interNodeBit)
+				p.injectDirect(inner, cConnType)
 				lastInner = inner
 			}
 			return inner, nil
@@ -185,25 +183,25 @@ func (p *TLSPlugin) InjectIntoTLSConfig(tlsCfg *tls.Config, isInterNode bool) {
 		return
 	}
 
-	p.injectDirect(tlsCfg, interNodeBit)
+	p.injectDirect(tlsCfg, cConnType)
 }
 
 // injectDirect injects plugin hooks directly into tlsCfg (which must not have
 // GetConfigForClient set). The config's existing Certificates and CA pools
 // serve as fallbacks when a hook returns CRDB_TLS_FALLBACK.
-func (p *TLSPlugin) injectDirect(tlsCfg *tls.Config, interNodeBit C.uint8_t) {
+func (p *TLSPlugin) injectDirect(tlsCfg *tls.Config, cConnType C.uint8_t) {
 	if p.getCert != nil {
-		p.injectGetCertHooks(tlsCfg, interNodeBit)
+		p.injectGetCertHooks(tlsCfg, cConnType)
 	}
 	if p.verify != nil {
-		p.injectVerifyHook(tlsCfg, interNodeBit)
+		p.injectVerifyHook(tlsCfg, cConnType)
 	}
 }
 
 // injectGetCertHooks wires the get-cert plugin hook into tlsCfg.
 // Any Certificates already present in tlsCfg are saved as a fallback that is
 // used when the hook returns CRDB_TLS_FALLBACK.
-func (p *TLSPlugin) injectGetCertHooks(tlsCfg *tls.Config, interNodeBit C.uint8_t) {
+func (p *TLSPlugin) injectGetCertHooks(tlsCfg *tls.Config, cConnType C.uint8_t) {
 	getCertFn := p.getCert
 	freeBufFn := p.freeBuf
 
@@ -219,7 +217,7 @@ func (p *TLSPlugin) injectGetCertHooks(tlsCfg *tls.Config, interNodeBit C.uint8_
 		if hello.Conn != nil {
 			peerAddr = hello.Conn.RemoteAddr().String()
 		}
-		info := makeCConnInfo(hello.ServerName, peerAddr, interNodeBit)
+		info := makeCConnInfo(hello.ServerName, peerAddr, cConnType)
 		defer freeCConnInfo(info)
 
 		var certPtr *C.uchar
@@ -244,7 +242,7 @@ func (p *TLSPlugin) injectGetCertHooks(tlsCfg *tls.Config, interNodeBit C.uint8_
 
 	// Client-side: called when we initiate a connection to a peer.
 	tlsCfg.GetClientCertificate = func(_ *tls.CertificateRequestInfo) (*tls.Certificate, error) {
-		info := makeCConnInfo("", "", interNodeBit)
+		info := makeCConnInfo("", "", cConnType)
 		defer freeCConnInfo(info)
 
 		var certPtr *C.uchar
@@ -279,7 +277,7 @@ func (p *TLSPlugin) injectGetCertHooks(tlsCfg *tls.Config, interNodeBit C.uint8_
 // For client-side configs, InsecureSkipVerify is set so that Go's standard
 // server-certificate validation is bypassed. The saved RootCAs pool serves
 // as the fallback.
-func (p *TLSPlugin) injectVerifyHook(tlsCfg *tls.Config, interNodeBit C.uint8_t) {
+func (p *TLSPlugin) injectVerifyHook(tlsCfg *tls.Config, cConnType C.uint8_t) {
 	verifyFn := p.verify
 
 	// Determine whether this is a server-side or client-side config and capture
@@ -319,7 +317,7 @@ func (p *TLSPlugin) injectVerifyHook(tlsCfg *tls.Config, interNodeBit C.uint8_t)
 			ptrs[i] = (*C.uchar)(unsafe.Pointer(&der[0]))
 			lens[i] = C.int(len(der))
 		}
-		info := makeCConnInfo("", "", interNodeBit)
+		info := makeCConnInfo("", "", cConnType)
 		defer freeCConnInfo(info)
 		rc := C.call_verify_cert(verifyFn, info,
 			(**C.uchar)(unsafe.Pointer(&ptrs[0])),
@@ -369,11 +367,11 @@ func verifyWithPool(rawCerts [][]byte, pool *x509.CertPool) error {
 
 // makeCConnInfo allocates a tls_conn_info_t on the C heap.
 // Must be paired with freeCConnInfo.
-func makeCConnInfo(serverName, peerAddr string, isInterNode C.uint8_t) *C.tls_conn_info_t {
+func makeCConnInfo(serverName, peerAddr string, cConnType C.uint8_t) *C.tls_conn_info_t {
 	info := (*C.tls_conn_info_t)(C.calloc(1, C.sizeof_tls_conn_info_t))
 	info.peer_addr = C.CString(peerAddr)
 	info.server_name = C.CString(serverName)
-	info.is_inter_node = isInterNode
+	info.conn_type = cConnType
 	return info
 }
 

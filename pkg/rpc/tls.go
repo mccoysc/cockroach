@@ -164,13 +164,13 @@ func (ctx *SecurityContext) GetServerTLSConfig() (*tls.Config, error) {
 		return nil, wrapError(err)
 	}
 	// Inject plugin hooks (no-op when ctx.tlsPlugin is nil).
-	ctx.tlsPlugin.InjectIntoTLSConfig(tlsCfg, false /* isInterNode */)
+	ctx.tlsPlugin.InjectIntoTLSConfig(tlsCfg, tlsplugin.ConnTypeServerRPC)
 	return tlsCfg, nil
 }
 
 // GetNodeClientTLSConfig returns the tls.Config for outgoing node-to-node
-// connections. isInterNode=true is forwarded to the plugin so it can apply
-// node-specific policy via tls_conn_info_t.is_inter_node.
+// connections. ConnTypeClientNode is forwarded to the plugin so it can apply
+// node-specific policy via tls_conn_info_t.conn_type.
 func (ctx *SecurityContext) GetNodeClientTLSConfig() (*tls.Config, error) {
 	if ctx.config.Insecure {
 		return nil, nil
@@ -183,7 +183,7 @@ func (ctx *SecurityContext) GetNodeClientTLSConfig() (*tls.Config, error) {
 	if err != nil {
 		return nil, wrapError(err)
 	}
-	ctx.tlsPlugin.InjectIntoTLSConfig(tlsCfg, true /* isInterNode */)
+	ctx.tlsPlugin.InjectIntoTLSConfig(tlsCfg, tlsplugin.ConnTypeClientNode)
 	return tlsCfg, nil
 }
 
@@ -206,6 +206,7 @@ func (ctx *SecurityContext) getUIClientTLSConfig() (*tls.Config, error) {
 	if err != nil {
 		return nil, wrapError(err)
 	}
+	ctx.tlsPlugin.InjectIntoTLSConfig(tlsCfg, tlsplugin.ConnTypeClientUI)
 	return tlsCfg, nil
 }
 
@@ -230,6 +231,7 @@ func (ctx *SecurityContext) GetUIServerTLSConfig() (*tls.Config, error) {
 	if err != nil {
 		return nil, wrapError(err)
 	}
+	ctx.tlsPlugin.InjectIntoTLSConfig(tlsCfg, tlsplugin.ConnTypeServerUI)
 	return tlsCfg, nil
 }
 
