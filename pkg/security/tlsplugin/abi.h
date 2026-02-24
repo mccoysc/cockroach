@@ -104,6 +104,76 @@ typedef int (*crdb_tls_verify_cert_fn)(
  */
 typedef void (*crdb_tls_free_buf_fn)(void *ptr);
 
+
+/* =========================================================================
+ * Implementation-side prototype helpers
+ * =========================================================================
+ *
+ * When writing a plugin shared library (.so), define your hook functions with
+ * the signatures below and export them with the names you pass to the CLI
+ * flags.  The three macros expand to the concrete C function declarations so
+ * you can paste them directly into your .c / .h source.
+ *
+ * Example usage
+ * -------------
+ *   #include "abi.h"
+ *
+ *   // Implement Hook 1 – called on every TLS handshake that needs a cert.
+ *   CRDB_TLS_GET_CERT_PROTO(my_get_cert) {
+ *       // fill *cert_out / *cert_len / *key_out / *key_len with DER data
+ *       // allocated by malloc(); CockroachDB will call crdb_tls_free_buf.
+ *       return 0; // 0 = success
+ *   }
+ *
+ *   // Implement Hook 2 – called to verify the peer's certificate chain.
+ *   CRDB_TLS_VERIFY_CERT_PROTO(my_verify_cert) {
+ *       // inspect raw_certs[0..n_certs-1] (DER bytes, lengths in cert_lens)
+ *       return 0; // 0 = trusted
+ *   }
+ *
+ *   // Implement Hook 3 – MUST be exported as the fixed symbol name below.
+ *   CRDB_TLS_FREE_BUF_PROTO {
+ *       free(ptr);
+ *   }
+ *
+ * CLI flags to activate:
+ *   --tls-plugin-so /path/to/plugin.so
+ *   --tls-plugin-get-cert    my_get_cert      # matches Hook 1 above
+ *   --tls-plugin-verify-cert my_verify_cert   # matches Hook 2 above
+ */
+
+/*
+ * CRDB_TLS_GET_CERT_PROTO(fn_name)
+ *   Expands to the full prototype for a Hook 1 implementation.
+ *   fn_name is the exported symbol name passed to --tls-plugin-get-cert.
+ */
+#define CRDB_TLS_GET_CERT_PROTO(fn_name)                        \
+    int fn_name(                                                \
+        const tls_conn_info_t *conn_info,                      \
+        unsigned char        **cert_out, int *cert_len,        \
+        unsigned char        **key_out,  int *key_len)
+
+/*
+ * CRDB_TLS_VERIFY_CERT_PROTO(fn_name)
+ *   Expands to the full prototype for a Hook 2 implementation.
+ *   fn_name is the exported symbol name passed to --tls-plugin-verify-cert.
+ */
+#define CRDB_TLS_VERIFY_CERT_PROTO(fn_name)                     \
+    int fn_name(                                                \
+        const tls_conn_info_t        *conn_info,               \
+        const unsigned char * const  *raw_certs,               \
+        const int                    *cert_lens,               \
+        int                           n_certs)
+
+/*
+ * CRDB_TLS_FREE_BUF_PROTO
+ *   Expands to the prototype for the mandatory Hook 3 implementation.
+ *   The exported symbol name is FIXED as "crdb_tls_free_buf" – do not change
+ *   it.  CockroachDB resolves it automatically when get-cert is configured.
+ */
+#define CRDB_TLS_FREE_BUF_PROTO \
+    void crdb_tls_free_buf(void *ptr)
+
 #ifdef __cplusplus
 }
 #endif
