@@ -53,6 +53,7 @@ import (
 	"crypto/x509"
 	"fmt"
 	"net"
+	"sync"
 	"unsafe"
 
 	"github.com/cockroachdb/errors"
@@ -62,11 +63,21 @@ import (
 // All exported methods are nil-safe: a nil *TLSPlugin is always a no-op.
 type TLSPlugin struct {
 	cfg     *TLSPluginConfig
-	handle  unsafe.Pointer         // dlopen handle
-	getCert C.crdb_tls_get_cert_fn
-	verify  C.crdb_tls_verify_cert_fn
-	freeBuf C.crdb_tls_free_buf_fn
+	handle  unsafe.Pointer // dlopen handle
+
+	// Go-level hook functions set from CGo function pointers in Load().
+	// They may also be set directly in tests (no CGo required).
+	// hookGetCert returns (*tls.Certificate, nil) on success,
+	// (nil, errFallback) for CRDB_TLS_FALLBACK, or (nil, err) on error.
+	hookGetCert func(serverName, peerAddr string, connType ConnType) (*tls.Certificate, error)
+	// hookVerify returns nil to accept, errFallback for CRDB_TLS_FALLBACK,
+	// or a non-nil error to reject.
+	hookVerify func(rawCerts [][]byte, connType ConnType) error
 }
+
+// errFallback is the sentinel error returned by Go-level hook wrappers when
+// the C hook returns CRDB_TLS_FALLBACK. It is checked with errors.Is.
+var errFallback = errors.New("tlsplugin: CRDB_TLS_FALLBACK")
 
 // Load opens the shared library described by cfg and resolves all configured
 // symbols. Returns (nil, nil) when cfg is nil (no plugin configured).
@@ -91,13 +102,13 @@ func Load(cfg *TLSPluginConfig) (*TLSPlugin, error) {
 		return nil, errors.Newf("tlsplugin: dlopen(%q): %s", cfg.SoPath, msg)
 	}
 
-	// Resolve get-cert symbol.
+	// Resolve get-cert symbol and wrap it into a Go closure.
 	if cfg.Functions.GetCert != "" {
 		sym, err := dlsym(p.handle, cfg.Functions.GetCert)
 		if err != nil {
 			return nil, errors.Wrapf(err, "tlsplugin: resolving get-cert symbol %q", cfg.Functions.GetCert)
 		}
-		p.getCert = C.crdb_tls_get_cert_fn(sym)
+		getCertFn := C.crdb_tls_get_cert_fn(sym)
 
 		// crdb_tls_free_buf is mandatory when get-cert is configured.
 		freeSym, err := dlsym(p.handle, "crdb_tls_free_buf")
@@ -106,16 +117,62 @@ func Load(cfg *TLSPluginConfig) (*TLSPlugin, error) {
 				"tlsplugin: get-cert is configured but plugin does not export "+
 					"\"crdb_tls_free_buf\": %s", err)
 		}
-		p.freeBuf = C.crdb_tls_free_buf_fn(freeSym)
+		freeBufFn := C.crdb_tls_free_buf_fn(freeSym)
+
+		p.hookGetCert = func(serverName, peerAddr string, connType ConnType) (*tls.Certificate, error) {
+			info := makeCConnInfo(serverName, peerAddr, C.uint8_t(connType))
+			defer freeCConnInfo(info)
+			var certPtr *C.uchar
+			var certLen C.int
+			var keyPtr *C.uchar
+			var keyLen C.int
+			rc := C.call_get_cert(getCertFn, info, &certPtr, &certLen, &keyPtr, &keyLen)
+			if rc == C.CRDB_TLS_FALLBACK {
+				return nil, errFallback
+			}
+			if rc != 0 {
+				return nil, fmt.Errorf("tlsplugin: get-cert returned %d", int(rc))
+			}
+			cert, err := parseCertAndKey(certPtr, certLen, keyPtr, keyLen)
+			C.call_free_buf(freeBufFn, unsafe.Pointer(certPtr))
+			C.call_free_buf(freeBufFn, unsafe.Pointer(keyPtr))
+			return cert, err
+		}
 	}
 
-	// Resolve verify-cert symbol.
+	// Resolve verify-cert symbol and wrap it into a Go closure.
 	if cfg.Functions.VerifyCert != "" {
 		sym, err := dlsym(p.handle, cfg.Functions.VerifyCert)
 		if err != nil {
 			return nil, errors.Wrapf(err, "tlsplugin: resolving verify-cert symbol %q", cfg.Functions.VerifyCert)
 		}
-		p.verify = C.crdb_tls_verify_cert_fn(sym)
+		verifyFn := C.crdb_tls_verify_cert_fn(sym)
+
+		p.hookVerify = func(rawCerts [][]byte, connType ConnType) error {
+			n := len(rawCerts)
+			ptrs := make([]*C.uchar, n)
+			lens := make([]C.int, n)
+			for i, der := range rawCerts {
+				if len(der) == 0 {
+					return fmt.Errorf("tlsplugin: cert[%d] is empty", i)
+				}
+				ptrs[i] = (*C.uchar)(unsafe.Pointer(&der[0]))
+				lens[i] = C.int(len(der))
+			}
+			info := makeCConnInfo("", "", C.uint8_t(connType))
+			defer freeCConnInfo(info)
+			rc := C.call_verify_cert(verifyFn, info,
+				(**C.uchar)(unsafe.Pointer(&ptrs[0])),
+				(*C.int)(unsafe.Pointer(&lens[0])),
+				C.int(n))
+			if rc == C.CRDB_TLS_FALLBACK {
+				return errFallback
+			}
+			if rc != 0 {
+				return fmt.Errorf("tlsplugin: verify-cert rejected peer (rc=%d)", int(rc))
+			}
+			return nil
+		}
 	}
 
 	return p, nil
@@ -136,99 +193,196 @@ func dlsym(handle unsafe.Pointer, name string) (unsafe.Pointer, error) {
 }
 
 // InjectIntoTLSConfig wires the plugin hooks into tlsCfg.
-// isInterNode is forwarded to the plugin via tls_conn_info_t.is_inter_node.
+// connType identifies the call site and is forwarded to every hook via
+// tls_conn_info_t.conn_type.
 // No-op when the receiver is nil or tlsCfg is nil.
-func (p *TLSPlugin) InjectIntoTLSConfig(tlsCfg *tls.Config, isInterNode bool) {
+//
+// For configs that use GetConfigForClient (server-side), the hooks are
+// injected into each per-connection inner config returned by the callback.
+// The inner config's existing certificates (loaded from disk) serve as the
+// fallback when a hook returns CRDB_TLS_FALLBACK.
+func (p *TLSPlugin) InjectIntoTLSConfig(tlsCfg *tls.Config, connType ConnType) {
 	if p == nil || tlsCfg == nil {
 		return
 	}
 
-	interNodeBit := C.uint8_t(0)
-	if isInterNode {
-		interNodeBit = 1
+	cConnType := C.uint8_t(connType)
+
+	// For server-side configs, GetConfigForClient returns a per-connection inner
+	// config that holds the actual loaded certificates. Wrap the callback so the
+	// plugin hooks are injected into each returned inner config, but only once
+	// per unique config pointer (the cert manager caches configs between reloads).
+	if tlsCfg.GetConfigForClient != nil {
+		origGetConfig := tlsCfg.GetConfigForClient
+		var (
+			mu        sync.Mutex
+			lastInner *tls.Config
+		)
+		tlsCfg.GetConfigForClient = func(hello *tls.ClientHelloInfo) (*tls.Config, error) {
+			inner, err := origGetConfig(hello)
+			if err != nil || inner == nil {
+				return inner, err
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			if inner != lastInner {
+				// New inner config (first call or after certificate reload).
+				// Inject plugin hooks once into this config.
+				p.injectDirect(inner, ConnType(cConnType))
+				lastInner = inner
+			}
+			return inner, nil
+		}
+		// Return: hooks will be injected per-connection via the wrapped
+		// GetConfigForClient. Do not set outer-config hooks; they are bypassed
+		// by GetConfigForClient anyway.
+		return
 	}
 
-	if p.getCert != nil {
-		getCertFn := p.getCert
-		freeBufFn := p.freeBuf
+	p.injectDirect(tlsCfg, connType)
+}
 
-		// Server-side: called when a remote client connects to us.
-		tlsCfg.GetCertificate = func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
-			peerAddr := ""
-			if hello.Conn != nil {
-				peerAddr = hello.Conn.RemoteAddr().String()
-			}
-			info := makeCConnInfo(hello.ServerName, peerAddr, interNodeBit)
-			defer freeCConnInfo(info)
+// injectDirect injects plugin hooks directly into tlsCfg (which must not have
+// GetConfigForClient set). The config's existing Certificates and CA pools
+// serve as fallbacks when a hook returns errFallback (CRDB_TLS_FALLBACK).
+func (p *TLSPlugin) injectDirect(tlsCfg *tls.Config, connType ConnType) {
+	if p.hookGetCert != nil {
+		p.injectGetCertHooks(tlsCfg, connType)
+	}
+	if p.hookVerify != nil {
+		p.injectVerifyHook(tlsCfg, connType)
+	}
+}
 
-			var certPtr *C.uchar
-			var certLen C.int
-			var keyPtr *C.uchar
-			var keyLen C.int
-			if rc := C.call_get_cert(getCertFn, info, &certPtr, &certLen, &keyPtr, &keyLen); rc != 0 {
-				return nil, fmt.Errorf("tlsplugin: get-cert returned %d", int(rc))
-			}
-			cert, err := parseCertAndKey(certPtr, certLen, keyPtr, keyLen)
-			C.call_free_buf(freeBufFn, unsafe.Pointer(certPtr))
-			C.call_free_buf(freeBufFn, unsafe.Pointer(keyPtr))
-			return cert, err
+// injectGetCertHooks wires the get-cert plugin hook into tlsCfg.
+// Any Certificates already present in tlsCfg are saved as a fallback that is
+// used when the hook returns errFallback (CRDB_TLS_FALLBACK).
+func (p *TLSPlugin) injectGetCertHooks(tlsCfg *tls.Config, connType ConnType) {
+	hookFn := p.hookGetCert
+
+	// Capture and clear the disk-loaded certificates so that GetCertificate is
+	// always called (making the plugin the primary cert source). Cleared certs
+	// are used as the fallback when the hook returns errFallback.
+	fallbackCerts := tlsCfg.Certificates
+	tlsCfg.Certificates = nil
+
+	// Server-side: called when a remote client connects to us.
+	tlsCfg.GetCertificate = func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+		peerAddr := ""
+		if hello.Conn != nil {
+			peerAddr = hello.Conn.RemoteAddr().String()
 		}
-
-		// Client-side: called when we initiate a connection to a peer.
-		tlsCfg.GetClientCertificate = func(_ *tls.CertificateRequestInfo) (*tls.Certificate, error) {
-			info := makeCConnInfo("", "", interNodeBit)
-			defer freeCConnInfo(info)
-
-			var certPtr *C.uchar
-			var certLen C.int
-			var keyPtr *C.uchar
-			var keyLen C.int
-			if rc := C.call_get_cert(getCertFn, info, &certPtr, &certLen, &keyPtr, &keyLen); rc != 0 {
-				return nil, fmt.Errorf("tlsplugin: get-cert (client) returned %d", int(rc))
+		cert, err := hookFn(hello.ServerName, peerAddr, connType)
+		if errors.Is(err, errFallback) {
+			if len(fallbackCerts) == 0 {
+				return nil, errors.New("tlsplugin: get-cert signaled fallback but no fallback certificate is configured")
 			}
-			cert, err := parseCertAndKey(certPtr, certLen, keyPtr, keyLen)
-			C.call_free_buf(freeBufFn, unsafe.Pointer(certPtr))
-			C.call_free_buf(freeBufFn, unsafe.Pointer(keyPtr))
-			return cert, err
+			return &fallbackCerts[0], nil
 		}
+		return cert, err
 	}
 
-	if p.verify != nil {
-		verifyFn := p.verify
-		// Disable standard x509 chain validation; the plugin is the sole trust authority.
+	// Client-side: called when we initiate a connection to a peer.
+	tlsCfg.GetClientCertificate = func(_ *tls.CertificateRequestInfo) (*tls.Certificate, error) {
+		cert, err := hookFn("", "", connType)
+		if errors.Is(err, errFallback) {
+			if len(fallbackCerts) == 0 {
+				return nil, errors.New("tlsplugin: get-cert (client) signaled fallback but no fallback certificate is configured")
+			}
+			return &fallbackCerts[0], nil
+		}
+		return cert, err
+	}
+}
+
+// injectVerifyHook wires the verify-cert plugin hook into tlsCfg.
+//
+// For server-side configs (ClientAuth >= VerifyClientCertIfGiven), the hook
+// becomes the primary client-certificate verifier: ClientCAs is cleared and
+// ClientAuth is downgraded to prevent Go's automatic chain validation from
+// running before the plugin. The saved ClientCAs pool serves as the fallback
+// when the hook returns CRDB_TLS_FALLBACK.
+//
+// For client-side configs, InsecureSkipVerify is set so that Go's standard
+// server-certificate validation is bypassed. The saved RootCAs pool serves
+// as the fallback.
+func (p *TLSPlugin) injectVerifyHook(tlsCfg *tls.Config, connType ConnType) {
+	hookFn := p.hookVerify
+
+	// Determine whether this is a server-side or client-side config and capture
+	// the appropriate CA pool for fallback verification.
+	var fallbackPool *x509.CertPool
+	if tlsCfg.ClientCAs != nil || tlsCfg.ClientAuth >= tls.VerifyClientCertIfGiven {
+		// Server-side inner config: plugin becomes the primary client-cert verifier.
+		fallbackPool = tlsCfg.ClientCAs
+		tlsCfg.ClientCAs = nil
+		// Downgrade ClientAuth to prevent automatic chain verification while
+		// still requesting (or requiring) a client certificate.
+		switch tlsCfg.ClientAuth {
+		case tls.VerifyClientCertIfGiven:
+			tlsCfg.ClientAuth = tls.RequestClientCert
+		case tls.RequireAndVerifyClientCert:
+			tlsCfg.ClientAuth = tls.RequireAnyClientCert
+		}
+	} else {
+		// Client-side config: plugin verifies the server certificate.
+		fallbackPool = tlsCfg.RootCAs
+		// Disable standard server-cert verification; the plugin (or fallback)
+		// handles it entirely.
 		tlsCfg.InsecureSkipVerify = true //nolint:gosec
-		tlsCfg.VerifyPeerCertificate = func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
-			if len(rawCerts) == 0 {
-				return errors.New("tlsplugin: peer sent no certificates")
-			}
-			n := len(rawCerts)
-			ptrs := make([]*C.uchar, n)
-			lens := make([]C.int, n)
-			for i, der := range rawCerts {
-				ptrs[i] = (*C.uchar)(unsafe.Pointer(&der[0]))
-				lens[i] = C.int(len(der))
-			}
-			info := makeCConnInfo("", "", interNodeBit)
-			defer freeCConnInfo(info)
-			rc := C.call_verify_cert(verifyFn, info,
-				(**C.uchar)(unsafe.Pointer(&ptrs[0])),
-				(*C.int)(unsafe.Pointer(&lens[0])),
-				C.int(n))
-			if rc != 0 {
-				return fmt.Errorf("tlsplugin: verify-cert rejected peer (rc=%d)", int(rc))
-			}
-			return nil
-		}
 	}
+
+	tlsCfg.VerifyPeerCertificate = func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
+		if len(rawCerts) == 0 {
+			return errors.New("tlsplugin: peer sent no certificates")
+		}
+		err := hookFn(rawCerts, connType)
+		if errors.Is(err, errFallback) {
+			if fallbackPool == nil {
+				return errors.New("tlsplugin: verify-cert signaled fallback but no fallback CA is configured")
+			}
+			return verifyWithPool(rawCerts, fallbackPool)
+		}
+		return err
+	}
+}
+
+// verifyWithPool performs standard x509 chain verification of rawCerts against
+// pool. Used as the fallback when a verify-cert hook returns CRDB_TLS_FALLBACK.
+func verifyWithPool(rawCerts [][]byte, pool *x509.CertPool) error {
+	certs := make([]*x509.Certificate, len(rawCerts))
+	for i, der := range rawCerts {
+		cert, err := x509.ParseCertificate(der)
+		if err != nil {
+			return errors.Wrapf(err, "tlsplugin: fallback: parsing cert[%d]", i)
+		}
+		certs[i] = cert
+	}
+	intermediates := x509.NewCertPool()
+	for _, cert := range certs[1:] {
+		intermediates.AddCert(cert)
+	}
+	_, err := certs[0].Verify(x509.VerifyOptions{
+		Roots:         pool,
+		Intermediates: intermediates,
+		// Accept any extended key usage: verifyWithPool is called for both
+		// client-side (verifying server auth) and server-side (verifying client
+		// auth) fallback paths, so we cannot restrict to a single key usage here.
+		KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageAny},
+	})
+	if err != nil {
+		return errors.Wrap(err, "tlsplugin: fallback x509 verification failed")
+	}
+	return nil
 }
 
 // makeCConnInfo allocates a tls_conn_info_t on the C heap.
 // Must be paired with freeCConnInfo.
-func makeCConnInfo(serverName, peerAddr string, isInterNode C.uint8_t) *C.tls_conn_info_t {
+func makeCConnInfo(serverName, peerAddr string, cConnType C.uint8_t) *C.tls_conn_info_t {
 	info := (*C.tls_conn_info_t)(C.calloc(1, C.sizeof_tls_conn_info_t))
 	info.peer_addr = C.CString(peerAddr)
 	info.server_name = C.CString(serverName)
-	info.is_inter_node = isInterNode
+	info.conn_type = cConnType
 	return info
 }
 

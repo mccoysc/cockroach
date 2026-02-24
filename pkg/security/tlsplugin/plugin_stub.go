@@ -31,4 +31,4 @@ func Load(cfg *TLSPluginConfig) (*TLSPlugin, error) {
 }
 
 // InjectIntoTLSConfig is a no-op on non-Linux platforms.
-func (p *TLSPlugin) InjectIntoTLSConfig(_ *tls.Config, _ bool) {}
+func (p *TLSPlugin) InjectIntoTLSConfig(_ *tls.Config, _ ConnType) {}
